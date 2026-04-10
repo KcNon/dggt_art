@@ -135,6 +135,7 @@ def fix_axis_sign_ambiguity(
     pred_axis: torch.Tensor,    # [B, P, 3]
     pred_scalar: torch.Tensor,  # [B, P, S]
     gt_axis: torch.Tensor,      # [B, P, 3]  (already aligned via match)
+    confidence_threshold: float = 0.3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Resolve 180° axis-direction ambiguity AFTER Hungarian matching.
@@ -143,19 +144,28 @@ def fix_axis_sign_ambiguity(
     the axis and the scalar so that the loss is always computed in a consistent
     half-space, eliminating the bimodal gradient oscillation problem.
 
+    A confidence threshold is applied: flipping is only performed when the dot
+    product is sufficiently negative (|dot| > threshold AND dot < 0). When the
+    dot product is near zero, the two axes are nearly perpendicular and the
+    Hungarian match is unreliable — flipping in this case would inject
+    random-direction gradients into scalar_mlp, causing the loss spikes
+    observed in training (scalar MSE → 4.0, i.e. 4× worse than predicting zero).
+
     Args:
-        pred_axis:   [B, P, 3]  predicted unit axes
-        pred_scalar: [B, P, S]  predicted motion scalars
-        gt_axis:     [B, P, 3]  GT unit axes (aligned to pred ordering)
+        pred_axis:            [B, P, 3]  predicted unit axes
+        pred_scalar:          [B, P, S]  predicted motion scalars
+        gt_axis:              [B, P, 3]  GT unit axes (aligned to pred ordering)
+        confidence_threshold: only flip when dot < -threshold (default 0.3)
     Returns:
         fixed_axis:   [B, P, 3]
         fixed_scalar: [B, P, S]
     """
-    dot   = (pred_axis * gt_axis).sum(dim=-1, keepdim=True)  # [B, P, 1]
-    flip  = (dot < 0).float()                                  # 1 where flip needed
+    dot  = (pred_axis * gt_axis).sum(dim=-1, keepdim=True)  # [B, P, 1]
+    # Flip only when we are confident the axis is in the wrong hemisphere.
+    flip = (dot < -confidence_threshold).float()             # 1 where confident flip needed
 
-    fixed_axis   = pred_axis   * (1.0 - 2.0 * flip)              # [B, P, 3]
-    fixed_scalar = pred_scalar * (1.0 - 2.0 * flip)              # [B, P, S]
+    fixed_axis   = pred_axis   * (1.0 - 2.0 * flip)         # [B, P, 3]
+    fixed_scalar = pred_scalar * (1.0 - 2.0 * flip)         # [B, P, S]
 
     return fixed_axis, fixed_scalar
 

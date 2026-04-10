@@ -193,12 +193,14 @@ def kinematic_loss(
     else:
         losses["pivot"] = pivot.new_zeros(1).squeeze()
 
-    # ── Scalar L2 loss ───────────────────────────────────────────────────
+    # ── Scalar Huber loss ────────────────────────────────────────────────
+    # Huber loss (delta=1.0) clips the gradient for large errors, preventing
+    # the 4× MSE spikes seen when sign-fix is uncertain (|dot| near zero).
     # scalars: [B, P_gt, S] (already reordered by match_and_fix)
     if alive.any():
         sc_alive    = scalars[alive]             # [K, S]
         gt_sc_alive = gt_scalars[alive]          # [K, S]
-        losses["scalar"] = weights["scalar"] * F.mse_loss(sc_alive, gt_sc_alive)
+        losses["scalar"] = weights["scalar"] * F.huber_loss(sc_alive, gt_sc_alive, delta=1.0)
     else:
         losses["scalar"] = scalars.new_zeros(1).squeeze()
 
@@ -594,10 +596,40 @@ def compute_loss(
     else:
         l_pseudo = assign_maps.new_zeros(1).squeeze()
 
+    # ── Camera pose encoding loss ─────────────────────────────────────────
+    # Supervise CameraHead using GT extrinsics so it is trained during Phase 1b.
+    # Without this, camera_head parameters receive no gradient and remain at
+    # their VGGT-pretrained init — causing cold-start failure when Phase 2
+    # switches to predicted (not GT) extrinsics.
+    #
+    # GT extrinsics in the dataset are cam-to-world [B, S, 4, 4].
+    # extri_intri_to_pose_encoding expects world-to-cam [B, S, 3, 4], OpenCV.
+    w_pose = getattr(cfg, "w_pose_enc", 0.0)
+    if w_pose > 0.0 and "pose_enc" in preds and batch.get("has_pose", True):
+        from dggt.utils.pose_enc import extri_intri_to_pose_encoding
+        gt_c2w = batch["extrinsics"].to(device).float()  # [B, S, 4, 4]
+        intr   = batch["intrinsics"].to(device).float()  # [B, 3, 3]
+        # Invert cam-to-world → world-to-cam [B, S, 4, 4]
+        R_c2w = gt_c2w[:, :, :3, :3]           # [B, S, 3, 3]
+        t_c2w = gt_c2w[:, :, :3, 3:4]          # [B, S, 3, 1]
+        R_w2c = R_c2w.transpose(-1, -2)         # [B, S, 3, 3]
+        t_w2c = -R_w2c @ t_c2w                 # [B, S, 3, 1]
+        w2c_34 = torch.cat([R_w2c, t_w2c], dim=-1)  # [B, S, 3, 4]
+        # Expand intrinsics to [B, S, 3, 3]
+        S_frames = gt_c2w.shape[1]
+        intr_bs = intr.unsqueeze(1).expand(-1, S_frames, -1, -1)
+        gt_pose_enc = extri_intri_to_pose_encoding(
+            w2c_34, intr_bs, image_size_hw=(H, W)
+        )  # [B, S, 9]
+        l_pose = w_pose * F.mse_loss(preds["pose_enc"].float(), gt_pose_enc.detach())
+        loss_dict["pose_enc"] = l_pose
+    else:
+        l_pose = assign_maps.new_zeros(1).squeeze()
+
     total = (l_mask + l_sparse
              + kin_losses["type"] + kin_losses["axis"]
              + kin_losses["pivot"] + kin_losses["scalar"]
-             + l_dead_op + l_render + l_bbox + l_pseudo)
+             + l_dead_op + l_render + l_bbox + l_pseudo + l_pose)
     loss_dict["total"] = total
     return total, loss_dict
 
@@ -683,6 +715,7 @@ def main(cfg: argparse.Namespace):
         scene_radius=cfg.scene_radius,
         use_camera_head=True,
         stop_gradient_plucker=(cfg.phase == "2"),
+        gradient_checkpointing=getattr(cfg, "gradient_checkpointing", False),
     ).to(device)
 
     # Set initial phase and warmup state
@@ -991,8 +1024,15 @@ def parse_args():
     p.add_argument("--w_render",        type=float, default=1.0)
     p.add_argument("--w_pseudo_mask",   type=float, default=0.05)
     p.add_argument("--w_bbox",          type=float, default=0.5)
+    p.add_argument("--w_pose_enc",      type=float, default=0.1,
+                   help="Weight for camera pose encoding supervision loss. "
+                        "Trains CameraHead during Phase 1b using GT extrinsics.")
     p.add_argument("--l1_sparsity",     type=float, default=0.1)
     p.add_argument("--l1_sparsity_warmup", type=float, default=0.0)
+    p.add_argument("--gradient_checkpointing", action="store_true",
+                   help="Enable gradient checkpointing on Aggregator attention blocks "
+                        "to reduce activation memory at the cost of ~33%% extra compute. "
+                        "Recommended when num_frames > 2.")
 
     # Logging
     p.add_argument("--log_interval",    type=int, default=50)

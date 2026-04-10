@@ -8,6 +8,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple, Union, List, Dict, Any
 
 from dggt.layers import PatchEmbed
@@ -113,6 +114,7 @@ class Aggregator(nn.Module):
         self.aa_order = aa_order
         self.patch_size = patch_size
         self.aa_block_size = aa_block_size
+        self.use_gradient_checkpointing = False  # toggled by set_gradient_checkpointing()
 
         # Validate that depth is divisible by aa_block_size
         if self.depth % self.aa_block_size != 0:
@@ -131,6 +133,9 @@ class Aggregator(nn.Module):
         # Initialize parameters with small values
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
+
+    def set_gradient_checkpointing(self, value: bool):
+        self.use_gradient_checkpointing = value
 
         # Register normalization constants as buffers
         for name, value in (
@@ -229,12 +234,14 @@ class Aggregator(nn.Module):
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1) #B*S, P', C
 
-        penultimate_features = self.patch_embed.get_intermediate_layers(images, n=24)
+        # n=1: only retrieve the final DINOv2 layer (saves ~23x memory vs n=24).
+        # Previously n=24 was used but dino_token_list[i] indexed i=0 everywhere (bug),
+        # so only the first (weakest) layer was ever used. Now we correctly use the last.
+        penultimate_features = self.patch_embed.get_intermediate_layers(images, n=1)
         dino_token_list = []
         for i in range(len(penultimate_features)):
-            dino_tokens = torch.cat([camera_token, register_token, penultimate_features[i]], dim=1).view(B, S, -1, C) #tokens 
+            dino_tokens = torch.cat([camera_token, register_token, penultimate_features[i]], dim=1).view(B, S, -1, C)
             dino_token_list.append(dino_tokens)
-        #dino_tokens = tokens.view(B, S, -1, C)
 
         pos = None
         if self.rope is not None:
@@ -253,9 +260,11 @@ class Aggregator(nn.Module):
         frame_idx = 0
         global_idx = 0
         output_list = []
-
-
         output_list_with_tokens = []
+
+        # dino_token_list[0] is the final DINOv2 layer (n=1 → only last layer returned).
+        # All aggregator outputs are concatenated with these final-layer features.
+        dino_final = dino_token_list[0]  # [B, S, P_total, embed_dim]
 
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
@@ -274,10 +283,9 @@ class Aggregator(nn.Module):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
-                
-                #TODO: use dino feature only or not
-                concat_inter_with_tokens = torch.cat([dino_token_list[i], frame_intermediates[i], global_intermediates[i]], dim=-1)
-                #concat_inter_with_tokens = dino_token_list[i]
+
+                # Concatenate with the final DINOv2 layer features: [B, S, P, 3C]
+                concat_inter_with_tokens = torch.cat([dino_final, frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list_with_tokens.append(concat_inter_with_tokens)
 
         del concat_inter
@@ -290,7 +298,6 @@ class Aggregator(nn.Module):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
-        # If needed, reshape tokens or positions:
         if tokens.shape != (B * S, P, C):
             tokens = tokens.view(B, S, P, C).view(B * S, P, C)
 
@@ -299,9 +306,16 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
+            blk = self.frame_blocks[frame_idx]
+            if self.use_gradient_checkpointing and self.training:
+                # checkpoint requires all inputs to be tensors; wrap pos carefully
+                _pos = pos
+                def _frame_fn(t, p=_pos, b=blk):
+                    return b(t, pos=p)
+                tokens = checkpoint(_frame_fn, tokens, use_reentrant=False)
+            else:
+                tokens = blk(tokens, pos=pos)
             frame_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
@@ -319,9 +333,15 @@ class Aggregator(nn.Module):
 
         intermediates = []
 
-        # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
-            tokens = self.global_blocks[global_idx](tokens, pos=pos)
+            blk = self.global_blocks[global_idx]
+            if self.use_gradient_checkpointing and self.training:
+                _pos = pos
+                def _global_fn(t, p=_pos, b=blk):
+                    return b(t, pos=p)
+                tokens = checkpoint(_global_fn, tokens, use_reentrant=False)
+            else:
+                tokens = blk(tokens, pos=pos)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

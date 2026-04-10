@@ -68,11 +68,13 @@ class ArtVGGT(nn.Module):
         scene_radius: float = 1.0,
         use_camera_head: bool = True,
         stop_gradient_plucker: bool = False,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.num_slots  = num_slots
         self.stop_gradient_plucker = stop_gradient_plucker
+        self._gradient_checkpointing = gradient_checkpointing
 
         dim_agg = 2 * embed_dim     # Aggregator produces frame+global concat → 2×D
 
@@ -83,6 +85,8 @@ class ArtVGGT(nn.Module):
             embed_dim=embed_dim,
         )
         self.patch_start_idx = self.aggregator.patch_start_idx  # = 5
+        if gradient_checkpointing:
+            self.aggregator.set_gradient_checkpointing(True)
 
         # ── Optional pose estimator ────────────────────────────────────────
         self.camera_head = CameraHead(dim_in=dim_agg) if use_camera_head else None
