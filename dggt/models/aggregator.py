@@ -67,6 +67,7 @@ class Aggregator(nn.Module):
         qk_norm=True,
         rope_freq=100,
         init_values=0.01,
+        num_slots=0,           # >0 → learnable slot tokens participate in global attention
     ):
         super().__init__()
 
@@ -134,8 +135,13 @@ class Aggregator(nn.Module):
         nn.init.normal_(self.camera_token, std=1e-6)
         nn.init.normal_(self.register_token, std=1e-6)
 
-    def set_gradient_checkpointing(self, value: bool):
-        self.use_gradient_checkpointing = value
+        # ── Learnable part slot tokens (participate in global attention) ──
+        # Slots have no spatial position; they receive zero RoPE position.
+        self.num_slots = num_slots
+        if num_slots > 0:
+            self.slot_tokens = nn.Parameter(torch.randn(1, num_slots, embed_dim) * 0.02)
+
+
 
         # Register normalization constants as buffers
         for name, value in (
@@ -147,6 +153,9 @@ class Aggregator(nn.Module):
                 torch.FloatTensor(value).view(1, 1, 3, 1, 1),
                 persistent=False,
             )
+            
+    def set_gradient_checkpointing(self, value: bool):
+        self.use_gradient_checkpointing = value
 
     def __build_patch_embed__(
         self,
@@ -266,6 +275,11 @@ class Aggregator(nn.Module):
         # All aggregator outputs are concatenated with these final-layer features.
         dino_final = dino_token_list[0]  # [B, S, P_total, embed_dim]
 
+        # Initialise slot states if the model has slot tokens
+        slot_states: Optional[torch.Tensor] = None
+        if self.num_slots > 0:
+            slot_states = self.slot_tokens.expand(B, -1, -1).contiguous()  # [B, P_slot, C]
+
         for _ in range(self.aa_block_num):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -273,9 +287,11 @@ class Aggregator(nn.Module):
                         tokens, B, S, P, C, frame_idx, pos=pos
                     )
                 elif attn_type == "global":
-                    tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
-                    )
+                    tokens, slot_states, global_idx, global_intermediates = \
+                        self._process_global_attention(
+                            tokens, B, S, P, C, global_idx, pos=pos,
+                            slot_tokens=slot_states,
+                        )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
 
@@ -292,7 +308,8 @@ class Aggregator(nn.Module):
         del frame_intermediates
         del global_intermediates
         del concat_inter_with_tokens
-        return output_list, output_list_with_tokens, dino_token_list, image_feature, self.patch_start_idx
+        # slot_states: [B, P_slot, C] final slot representations, or None
+        return output_list, output_list_with_tokens, dino_token_list, image_feature, self.patch_start_idx, slot_states
 
     def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
         """
@@ -321,15 +338,35 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None,
+                                   slot_tokens=None):
         """
-        Process global attention blocks. We keep tokens in shape (B, S*P, C).
+        Process global attention blocks across all frames.
+
+        When slot_tokens [B, P_slot, C] is provided, they are appended to the
+        image-token sequence before attention and split back out afterwards.
+        Slots get zero RoPE position (no spatial prior).
+
+        Returns (img_tokens, updated_slot_tokens, global_idx, intermediates).
+        img_tokens shape: [B, S*P, C]   (slots NOT included)
+        updated_slot_tokens: [B, P_slot, C] or None
+        intermediates: list of [B, S, P, C] (image tokens only, for output_list)
         """
+        # Reshape image tokens to [B, S*P, C]
         if tokens.shape != (B, S * P, C):
             tokens = tokens.view(B, S, P, C).view(B, S * P, C)
 
         if pos is not None and pos.shape != (B, S * P, 2):
             pos = pos.view(B, S, P, 2).view(B, S * P, 2)
+
+        # Concatenate slot tokens to image sequence for joint attention
+        P_slot = 0
+        if slot_tokens is not None:
+            P_slot = slot_tokens.shape[1]
+            tokens = torch.cat([tokens, slot_tokens], dim=1)  # [B, S*P + P_slot, C]
+            if pos is not None:
+                slot_pos = torch.zeros(B, P_slot, 2, device=pos.device, dtype=pos.dtype)
+                pos = torch.cat([pos, slot_pos], dim=1)
 
         intermediates = []
 
@@ -343,9 +380,17 @@ class Aggregator(nn.Module):
             else:
                 tokens = blk(tokens, pos=pos)
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            # Intermediates: image tokens only [B, S, P, C]
+            intermediates.append(tokens[:, :S * P].view(B, S, P, C))
 
-        return tokens, global_idx, intermediates
+        # Split back: image tokens and updated slot tokens
+        if P_slot > 0:
+            updated_slots = tokens[:, S * P:]   # [B, P_slot, C]
+            tokens = tokens[:, :S * P]          # [B, S*P, C]
+        else:
+            updated_slots = None
+
+        return tokens, updated_slots, global_idx, intermediates
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

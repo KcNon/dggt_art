@@ -78,11 +78,14 @@ class ArtVGGT(nn.Module):
 
         dim_agg = 2 * embed_dim     # Aggregator produces frame+global concat → 2×D
 
-        # ── Encoder (unchanged from VGGT) ──────────────────────────────────
+        # ── Encoder ────────────────────────────────────────────────────────
+        # num_slots passed so Aggregator initialises learnable slot tokens that
+        # participate in every global attention block (cross-frame).
         self.aggregator = Aggregator(
             img_size=img_size,
             patch_size=patch_size,
             embed_dim=embed_dim,
+            num_slots=num_slots,
         )
         self.patch_start_idx = self.aggregator.patch_start_idx  # = 5
         if gradient_checkpointing:
@@ -112,6 +115,8 @@ class ArtVGGT(nn.Module):
             num_slots=num_slots,
             n_gaussians=n_gaussians,
             scene_radius=scene_radius,
+            dim_patch=3 * embed_dim,   # agg_last(2C) + dino_last(C) = 3C
+            dim_proj=256,
         )
 
     # ------------------------------------------------------------------
@@ -168,7 +173,10 @@ class ArtVGGT(nn.Module):
          img_tokens_list,
          dino_tokens_list,
          image_feature,
-         patch_start_idx) = self.aggregator(images)
+         patch_start_idx,
+         slot_states) = self.aggregator(images)
+        # slot_states: [B, P, embed_dim] — slot tokens refined through all
+        # global attention blocks, carrying cross-frame/view context.
         # dino_tokens_list[-1]: [B, S, P_total, embed_dim] — DINOv2 last-layer features
         dino_tokens = dino_tokens_list[-1]
 
@@ -223,6 +231,7 @@ class ArtVGGT(nn.Module):
             plucker_rays,
             timestamps,
             img_hw=(H, W),
+            slot_init=slot_states,   # slot tokens pre-enriched by Aggregator global blocks
         )
         preds["slot_features"] = slot_features   # [B, P, D]
         preds["assign_maps"]   = assign_maps      # [B, P, H_p, W_p]
@@ -239,10 +248,20 @@ class ArtVGGT(nn.Module):
         })
 
         # ── 6. Gaussian head (mu constrained by predicted bbox) ─────────────
+        # First-frame patch features: concat Aggregator last-layer (2C) and
+        # DINOv2 last-layer (C) → [B, N_p, 3C=3072].
+        # Special tokens (camera + register, patch_start_idx=5) are excluded
+        # so only spatial patch tokens are used for the masked pooling.
+        agg_frame0  = image_tokens[:, 0, patch_start_idx:, :]   # [B, N_p, 2C]
+        dino_frame0 = dino_tokens[:,  0, patch_start_idx:, :]   # [B, N_p,  C]
+        patch_feats_frame0 = torch.cat([agg_frame0, dino_frame0], dim=-1)  # [B, N_p, 3C]
+
         gs = self.gaussian_head(
             slot_features,
             bbox_center=art["bbox_center"],
             bbox_size=art["bbox_size"],
+            patch_feats_frame0=patch_feats_frame0,
+            assign_maps=assign_maps,
         )
         preds["gs_mu"]      = gs["mu"]       # [B, P, N_g, 3]
         preds["gs_rot"]     = gs["rot"]      # [B, P, N_g, 4]

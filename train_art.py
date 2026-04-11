@@ -430,23 +430,134 @@ def per_part_alpha_render_loss(
     return total_loss / n_terms
 
 
-def _rgb_mask_render_stub(
-    gs_mu: torch.Tensor,       # [B, P, N_g, 3]
-    gs_opacity: torch.Tensor,  # [B, P, N_g, 1]
-    assign_maps: torch.Tensor, # [B, P, H_p, W_p]
-    gt_images: torch.Tensor,   # [B, S, 3, H, W]  (sampled frames)
-    gt_masks: torch.Tensor,    # [B, P, H, W]
-    is_dead: torch.Tensor,     # [B, P]
+def global_render_loss(
+    gs_mu:              torch.Tensor,   # [B, P, N_g, 3]  canonical positions
+    gs_rot:             torch.Tensor,   # [B, P, N_g, 4]  unit quaternions (w,x,y,z)
+    gs_scale:           torch.Tensor,   # [B, P, N_g, 3]  positive scales
+    gs_color:           torch.Tensor,   # [B, P, N_g, 3]  RGB ∈ [0, 1]
+    gs_opacity:         torch.Tensor,   # [B, P, N_g, 1]  ∈ (0, 1)
+    motion_type_logits: torch.Tensor,   # [B, P, 2]
+    axis:               torch.Tensor,   # [B, P, 3]
+    pivot:              torch.Tensor,   # [B, P, 3]
+    scalars:            torch.Tensor,   # [B, P, S]
+    extrinsics:         torch.Tensor,   # [B, S, 4, 4]  cam-to-world
+    intrinsics:         torch.Tensor,   # [B, 3, 3]
+    gt_images:          torch.Tensor,   # [B, S, 3, H, W]  in [0, 1]
+    is_dead:            torch.Tensor,   # [B, P]
+    max_frames:         int = 2,        # max frames rendered per sample (efficiency)
 ) -> torch.Tensor:
     """
-    Placeholder for 3DGS rasterization-based RGB and mask rendering loss.
+    Global composited rendering loss using gsplat rasterization.
 
-    Full implementation requires a differentiable 3DGS renderer (gsplat).
-    This stub returns zero so the training loop compiles and runs without
-    the renderer installed. Replace with actual rendering in Phase 1b.
+    For each (batch, frame) pair, applies rigid transforms to ALL part Gaussians,
+    concatenates them, renders a full RGB image via gsplat, and computes L1 loss
+    against the GT image. Dead slots have their opacities zeroed out.
+
+    Activated in Phase 1b (post-warmup) alongside per-part alpha loss.
     """
-    # TODO: integrate gsplat rasterization
-    return gs_mu.new_zeros(1).squeeze()
+    from gsplat.rendering import rasterization as gsplat_rasterize
+
+    B, P, N_g, _ = gs_mu.shape
+    S = scalars.shape[-1]
+    H, W = gt_images.shape[-2:]
+    device = gs_mu.device
+
+    # Motion probs [B, P, 3]: static, prismatic, revolute
+    motion_probs_2 = torch.softmax(motion_type_logits.float(), dim=-1)  # [B, P, 2]
+    static_col = torch.zeros(B, P, 1, device=device, dtype=motion_probs_2.dtype)
+    motion_probs_3 = torch.cat([static_col, motion_probs_2], dim=-1)    # [B, P, 3]
+    motion_probs_3[:, 0, :] = torch.tensor([1.0, 0.0, 0.0], device=device)
+
+    # Alive mask: zero opacities for dead slots
+    slot_alive = (~is_dead).float()   # [B, P]
+
+    total_loss = gs_mu.new_zeros(1).squeeze()
+    n_terms = 0
+
+    for b in range(B):
+        # Randomly sample frames to render (capped at max_frames for efficiency)
+        frame_indices = list(range(S))
+        if len(frame_indices) > max_frames:
+            frame_indices = random.sample(frame_indices, max_frames)
+
+        for t in frame_indices:
+            scalar_t = scalars[b, :, t]   # [P]
+
+            # Build world-to-cam from cam-to-world extrinsics
+            c2w = extrinsics[b, t].float()   # [4, 4]
+            R_c2w = c2w[:3, :3]
+            t_c2w = c2w[:3, 3:4]
+            R_w2c = R_c2w.T                           # [3, 3]
+            t_w2c = -R_w2c @ t_c2w                    # [3, 1]
+            w2c = torch.eye(4, device=device, dtype=torch.float32)
+            w2c[:3, :3] = R_w2c
+            w2c[:3, 3] = t_w2c.squeeze(-1)
+            viewmat = w2c.unsqueeze(0)                # [1, 4, 4]
+            K = intrinsics[b].float().unsqueeze(0)    # [1, 3, 3]
+
+            all_means, all_quats, all_scales, all_colors, all_opacities = [], [], [], [], []
+
+            for p in range(P):
+                mu_p  = gs_mu[b, p].float()           # [N_g, 3]
+                rot_p = gs_rot[b, p].float()           # [N_g, 4]
+                sc_p  = gs_scale[b, p].float()         # [N_g, 3]
+                col_p = gs_color[b, p].float()         # [N_g, 3]
+                op_p  = gs_opacity[b, p, :, 0].float() # [N_g]
+
+                mp = motion_probs_3[b, p]              # [3]
+                ax = axis[b, p]                        # [3]
+                pv = pivot[b, p]                       # [3]
+                sc = scalar_t[p]                       # []
+
+                mu_t, rot_t = apply_rigid_transform(mu_p, rot_p, mp, ax, pv, sc)
+
+                # Zero out opacity for dead slots (no gradient, just masking)
+                op_t = op_p * slot_alive[b, p]
+
+                all_means.append(mu_t)
+                all_quats.append(rot_t)
+                all_scales.append(sc_p)
+                all_colors.append(col_p)
+                all_opacities.append(op_t)
+
+            means     = torch.cat(all_means,     dim=0)  # [P*N_g, 3]
+            quats     = torch.cat(all_quats,     dim=0)  # [P*N_g, 4]
+            scales    = torch.cat(all_scales,    dim=0)  # [P*N_g, 3]
+            colors    = torch.cat(all_colors,    dim=0)  # [P*N_g, 3]
+            opacities = torch.cat(all_opacities, dim=0)  # [P*N_g]
+
+            try:
+                render_out, _, _ = gsplat_rasterize(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=opacities,
+                    colors=colors,
+                    viewmats=viewmat,
+                    Ks=K,
+                    width=W,
+                    height=H,
+                    near_plane=0.01,
+                    far_plane=1e4,
+                    sh_degree=None,
+                )
+                # render_out: [1, H, W, 3] → [3, H, W]
+                rendered = render_out[0].permute(2, 0, 1).clamp(0.0, 1.0)
+                gt_img   = gt_images[b, t].float().to(device)   # [3, H, W]
+
+                total_loss = total_loss + F.l1_loss(rendered, gt_img)
+                n_terms += 1
+            except Exception as _e:
+                # Log once per process to diagnose why gsplat is failing
+                import sys, traceback
+                print(f"[global_render_loss] gsplat failed b={b} t={t}: {_e}", flush=True)
+                traceback.print_exc(file=sys.stdout)
+                sys.stdout.flush()
+                break  # only log once per forward pass
+
+    if n_terms == 0:
+        return gs_mu.new_zeros(1).squeeze()
+    return total_loss / n_terms
 
 
 # ============================================================================
@@ -499,6 +610,18 @@ def compute_loss(
 
     loss_dict = {}
 
+    # ── Resolve extrinsics for rendering losses ───────────────────────────
+    # Prefer GT extrinsics when available (Phase 1a/1b); fall back to
+    # CameraHead prediction (Phase 2 real data without GT poses).
+    # This prevents unstable early CameraHead predictions from slowing
+    # down GaussianHead convergence during Phase 1b supervised training.
+    if "extrinsics" in batch:
+        render_extrinsics = batch["extrinsics"].to(device)
+    elif "predicted_extrinsics" in preds:
+        render_extrinsics = preds["predicted_extrinsics"].detach()
+    else:
+        render_extrinsics = None
+
     # ── Mask loss (always active) ─────────────────────────────────────────
     l_mask = mask_loss(assign_maps, gt_masks, matches)
     loss_dict["mask"] = l_mask
@@ -540,24 +663,21 @@ def compute_loss(
     l_dead_op = dead_slot_opacity_loss(opacity_flat, is_dead, cfg.w_dead_opacity)
     loss_dict["dead_opacity"] = l_dead_op
 
-    # ── Per-part alpha rendering loss (differentiable, no gsplat needed) ──
-    if cfg.w_render > 0.0:
+    # ── Build sign-corrected axis/scalar in prediction-slot order ────────
+    # Both local and global render losses index by prediction slot, not GT order.
+    # Recompute sign flip in pred-slot order to avoid conflicting gradients.
+    P_pred = preds["axis"].shape[1]
+    flip_mask = preds["axis"].new_zeros(B, P_pred, 1)   # [B, P, 1], no grad
+    for b, (pred_idx, gt_idx) in enumerate(matches):
+        if len(pred_idx) > 0:
+            dot_bm = (preds["axis"][b, pred_idx] * gt_axis[b, gt_idx]).sum(dim=-1)
+            flip_mask[b, pred_idx, 0] = (dot_bm < 0).float()
+    axis_for_render   = preds["axis"]    * (1.0 - 2.0 * flip_mask)   # [B, P, 3]
+    scalar_for_render = preds["scalars"] * (1.0 - 2.0 * flip_mask)   # [B, P, S]
+
+    # ── Per-part alpha rendering loss (local, differentiable, no gsplat) ─
+    if cfg.w_render > 0.0 and render_extrinsics is not None:
         gt_masks_seq = batch["part_masks"].to(device)   # [B, S, P, H, W]
-
-        # Build sign-corrected axis/scalar in PREDICTION-SLOT order for render_loss.
-        # render_loss indexes by prediction slot (p in range(P)), not GT order.
-        # axis_fixed/scalar_fixed from match_and_fix are in GT order, so we must
-        # recompute the sign flip in prediction-slot order to avoid conflicting
-        # gradients between render_loss and kinematic_loss.
-        P_pred = preds["axis"].shape[1]
-        flip_mask = preds["axis"].new_zeros(B, P_pred, 1)   # [B, P, 1], no grad
-        for b, (pred_idx, gt_idx) in enumerate(matches):
-            if len(pred_idx) > 0:
-                dot_bm = (preds["axis"][b, pred_idx] * gt_axis[b, gt_idx]).sum(dim=-1)
-                flip_mask[b, pred_idx, 0] = (dot_bm < 0).float()
-        axis_for_render   = preds["axis"]    * (1.0 - 2.0 * flip_mask)   # [B, P, 3]
-        scalar_for_render = preds["scalars"] * (1.0 - 2.0 * flip_mask)   # [B, P, S]
-
         l_render = cfg.w_render * per_part_alpha_render_loss(
             gs_mu              = preds["gs_mu"],
             gs_opacity         = preds["gs_opacity"],
@@ -565,7 +685,7 @@ def compute_loss(
             axis               = axis_for_render,
             pivot              = preds["pivot"],
             scalars            = scalar_for_render,
-            extrinsics         = batch["extrinsics"].to(device),
+            extrinsics         = render_extrinsics,
             intrinsics         = batch["intrinsics"].to(device),
             gt_masks_seq       = gt_masks_seq,
             is_dead            = is_dead,
@@ -575,16 +695,42 @@ def compute_loss(
         l_render = preds["gs_mu"].new_zeros(1).squeeze()
     loss_dict["render"] = l_render
 
+    # ── Global composited RGB rendering loss (gsplat rasterization) ──────
+    w_render_global = getattr(cfg, "w_render_global", 0.0)
+    if w_render_global > 0.0 and render_extrinsics is not None:
+        l_render_global = w_render_global * global_render_loss(
+            gs_mu              = preds["gs_mu"],
+            gs_rot             = preds["gs_rot"],
+            gs_scale           = preds["gs_scale"],
+            gs_color           = preds["gs_color"],
+            gs_opacity         = preds["gs_opacity"],
+            motion_type_logits = preds["motion_type_logits"],
+            axis               = axis_for_render,
+            pivot              = preds["pivot"],
+            scalars            = scalar_for_render,
+            extrinsics         = render_extrinsics,
+            intrinsics         = batch["intrinsics"].to(device),
+            gt_images          = batch["images"].to(device),
+            is_dead            = is_dead,
+            max_frames         = 2,
+        )
+    else:
+        l_render_global = preds["gs_mu"].new_zeros(1).squeeze()
+    loss_dict["render_global"] = l_render_global
+
     # ── BBox centroid projection loss ─────────────────────────────────────
-    l_bbox = cfg.w_bbox * bbox_loss(
-        bbox_center = preds["bbox_center"],
-        bbox_size   = preds["bbox_size"],
-        assign_maps = assign_maps,
-        extrinsics  = batch["extrinsics"].to(device),
-        intrinsics  = batch["intrinsics"].to(device),
-        gt_masks    = batch["part_masks"].to(device),
-        patch_size  = 14,
-    )
+    if render_extrinsics is not None:
+        l_bbox = cfg.w_bbox * bbox_loss(
+            bbox_center = preds["bbox_center"],
+            bbox_size   = preds["bbox_size"],
+            assign_maps = assign_maps,
+            extrinsics  = render_extrinsics,
+            intrinsics  = batch["intrinsics"].to(device),
+            gt_masks    = batch["part_masks"].to(device),
+            patch_size  = 14,
+        )
+    else:
+        l_bbox = preds["gs_mu"].new_zeros(1).squeeze()
     loss_dict["bbox"] = l_bbox
 
     # Phase 2 pseudo-mask loss (weak supervision from SAM2)
@@ -629,7 +775,7 @@ def compute_loss(
     total = (l_mask + l_sparse
              + kin_losses["type"] + kin_losses["axis"]
              + kin_losses["pivot"] + kin_losses["scalar"]
-             + l_dead_op + l_render + l_bbox + l_pseudo + l_pose)
+             + l_dead_op + l_render + l_render_global + l_bbox + l_pseudo + l_pose)
     loss_dict["total"] = total
     return total, loss_dict
 
@@ -1021,7 +1167,11 @@ def parse_args():
     p.add_argument("--w_pivot",         type=float, default=0.1)
     p.add_argument("--w_scalar",        type=float, default=0.3)
     p.add_argument("--w_dead_opacity",  type=float, default=0.1)
-    p.add_argument("--w_render",        type=float, default=1.0)
+    p.add_argument("--w_render",        type=float, default=1.0,
+                   help="Weight for per-part alpha rendering loss (local, no gsplat needed)")
+    p.add_argument("--w_render_global", type=float, default=0.0,
+                   help="Weight for global composited RGB rendering loss (gsplat rasterization). "
+                        "Set > 0 in Phase 1b to supervise full-scene appearance.")
     p.add_argument("--w_pseudo_mask",   type=float, default=0.05)
     p.add_argument("--w_bbox",          type=float, default=0.5)
     p.add_argument("--w_pose_enc",      type=float, default=0.1,

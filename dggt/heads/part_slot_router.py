@@ -206,10 +206,10 @@ class PartSlotRouter(nn.Module):
             nn.LayerNorm(dim_slot),
         )
 
-        # ── P learnable slot tokens ──────────────────────────────────────
-        self.slot_tokens = nn.Parameter(
-            torch.randn(1, num_slots, dim_slot) * 0.02
-        )
+        # slot_tokens have been moved into Aggregator.
+        # PartSlotRouter receives slot states from Aggregator as slot_init.
+        # A fallback self.slot_tokens is kept for standalone use only.
+        self._has_fallback_slots = False  # set True only if Aggregator has no slots
 
         # ── Transformer: [cross, cross, cross, self] × (num_layers // 4) ──
         # Layer schedule: every 4th layer (0-indexed: 3, 7, ...) is self-attn
@@ -230,7 +230,6 @@ class PartSlotRouter(nn.Module):
     # ------------------------------------------------------------------ #
 
     def _init_weights(self):
-        nn.init.trunc_normal_(self.slot_tokens, std=0.02)
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -249,6 +248,7 @@ class PartSlotRouter(nn.Module):
         plucker_rays: torch.Tensor,              # [B, S, N_patches, 6]
         timestamps:   torch.Tensor,              # [B, S]
         img_hw:       tuple[int, int] | None = None,
+        slot_init:    torch.Tensor | None = None,  # [B, P, dim_slot] from Aggregator
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -290,7 +290,15 @@ class PartSlotRouter(nn.Module):
         image_tokens = self.input_proj(enriched)                    # [B, S*N, dim_slot]
 
         # ── 4. Transformer layers ────────────────────────────────────────
-        slots = self.slot_tokens.expand(B, -1, -1).clone()         # [B, P, dim_slot]
+        # Use Aggregator-provided slot states as initial slot representations.
+        # slot_init comes from Aggregator's global_blocks, already enriched with
+        # multi-frame, multi-view context. PSR further refines them with plucker
+        # rays, timestamps, and the projected image tokens.
+        assert slot_init is not None, (
+            "slot_init must be provided from Aggregator. "
+            "Ensure Aggregator is constructed with num_slots > 0."
+        )
+        slots = slot_init                                           # [B, P, dim_slot]
         last_attn_weights: torch.Tensor | None = None
 
         for i, (layer, ltype) in enumerate(zip(self.layers, self.layer_types)):
