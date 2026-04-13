@@ -87,13 +87,18 @@ def _adjust_intrinsics(K: np.ndarray,
 
 def _normalize_scalars(values: list[float]) -> list[float]:
     """
-    Normalize a list of joint angle / distance values to [-1, 1].
-    If all values are the same (no motion), return zeros.
+    Normalize joint angle / distance values to [-1, 1], centered on rest state.
+
+    values[0] is the rest-state value (frame 0 = canonical rest pose).
+    After normalization, rest state → 0, and the largest deviation maps to ±1.
+    This gives scalar=0 a clear physical meaning: the joint is at rest.
     """
-    lo, hi = min(values), max(values)
-    if abs(hi - lo) < 1e-8:
+    rest = values[0]
+    shifted = [v - rest for v in values]
+    max_abs = max(abs(v) for v in shifted)
+    if max_abs < 1e-8:
         return [0.0] * len(values)
-    return [(v - lo) / (hi - lo) * 2.0 - 1.0 for v in values]
+    return [v / max_abs for v in shifted]
 
 
 # ---------------------------------------------------------------------------

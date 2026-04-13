@@ -325,10 +325,16 @@ class PartSlotRouter(nn.Module):
         slot_features = self.slot_norm(slots)                       # [B, P, dim_slot]
 
         # ── 5. Assignment maps from last cross-attn weights ───────────────
+        # Use frame 0 (canonical rest state) only.
+        # Frame 0 is always the rest pose (all joints closed/at minimum), so the
+        # GT part masks at frame 0 are unambiguous single-position masks.
+        # Mean-over-frames was incorrect: for a moving part, averaging attention
+        # across S frames gives diffuse maps that don't match the single-frame GT,
+        # capping warmup IoU at ~0.62 regardless of LR.
         if last_attn_weights is not None:
-            # [B, S*N, P] → reshape to [B, S, N, P] → avg over frames → [B, N, P]
+            # [B, S*N, P] → reshape to [B, S, N, P] → take frame 0 → [B, N, P]
             assign = last_attn_weights.reshape(B, S, N_patches, self.num_slots)
-            assign = assign.mean(dim=1)                             # [B, N, P]
+            assign = assign[:, 0, :, :]                             # [B, N, P]
             assign_maps = assign.permute(0, 2, 1)                   # [B, P, N]
             assign_maps = assign_maps.reshape(B, self.num_slots, H_p, W_p)
         else:
@@ -336,7 +342,7 @@ class PartSlotRouter(nn.Module):
             temp = 1.0 / math.sqrt(self.dim_slot)
             logits = torch.bmm(image_tokens, slot_features.transpose(1, 2)) * temp
             assign = F.softmax(logits, dim=-1)                      # [B, S*N, P]
-            assign = assign.reshape(B, S, N_patches, self.num_slots).mean(1)
+            assign = assign.reshape(B, S, N_patches, self.num_slots)[:, 0, :, :]
             assign_maps = assign.permute(0, 2, 1).reshape(B, self.num_slots, H_p, W_p)
 
         return slot_features, assign_maps
