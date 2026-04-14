@@ -145,8 +145,10 @@ def evaluate_scene(
         assign_maps.unsqueeze(0), (H, W), mode="bilinear", align_corners=False
     ).squeeze(0)                                      # [P, H, W]
 
-    # Max-project GT masks over frames → binary  [P_gt, H, W]
-    gt_masks_bin = (part_masks.max(dim=0).values > 0.5).float()  # [P_gt, H, W]
+    # Frame-0 GT masks (canonical rest state) — consistent with assign_maps.
+    # assign_maps is defined at the rest pose, so matching against the rest-state
+    # GT gives the correct slot→part correspondence without temporal ambiguity.
+    gt_masks_bin = (part_masks[0] > 0.5).float()                 # [P_gt, H, W]
 
     # ── Hungarian matching (argmax, active foreground only) ────────────────
     pred_idx, gt_idx = argmax_hungarian_match(assign_up, gt_masks_bin)

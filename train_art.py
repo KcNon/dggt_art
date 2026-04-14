@@ -790,50 +790,150 @@ def compute_loss(
 
 @torch.no_grad()
 def eval_mean_iou(model, val_loader, device, cfg) -> float:
-    """Compute mean mask IoU over validation set (used for warmup gate).
+    """Compute mean mask IoU over validation set.
 
-    Uses Hungarian matching to align predicted slots to GT parts before
-    computing IoU, so slot ordering ambiguity does not penalise the metric.
+    Phase 1a: assign_maps vs frame-0 GT (canonical rest state).
+              Dead/empty slots are excluded.
+    Phase 1b: per-frame alpha-projection IoU — full pipeline
+              (assign_maps → GS → ArticulationHead(scalar_t) → project → mask_t)
+              compared against each frame's GT mask.
+              Dead slots and frames where GT is empty are excluded.
+
+    Hungarian matching aligns predicted slots to GT parts in both phases.
     """
     from dggt.utils.hungarian_matching import batch_hungarian_match
     model.eval()
     iou_sum, count = 0.0, 0
+    is_phase1b = (cfg.phase != "1a")
 
     try:
-        for batch in val_loader:
-            images     = batch["images"].to(device)
-            extrinsics = batch["extrinsics"].to(device)
-            intrinsics = batch["intrinsics"].to(device)
-            timestamps = batch["timestamps"].to(device)
-            # Frame 0 GT masks (canonical rest state), consistent with assign_maps
-            part_masks_raw = batch["part_masks"].to(device)      # [B, S, P, H, W]
-            gt_masks = (part_masks_raw[:, 0] > 0.5).float()     # [B, P_gt, H, W]
+        with torch.no_grad():
+            for batch in val_loader:
+                images     = batch["images"].to(device)
+                extrinsics = batch["extrinsics"].to(device)
+                intrinsics = batch["intrinsics"].to(device)
+                timestamps = batch["timestamps"].to(device)
+                part_masks_raw = batch["part_masks"].to(device)   # [B, S, P_gt, H, W]
+                B, S, P_gt, H, W = part_masks_raw.shape
 
-            preds = model(images, extrinsics, intrinsics, timestamps)
-            assign_maps = preds["assign_maps"]   # [B, P, H_p, W_p]
-            B, P, H_p, W_p = assign_maps.shape
-            H, W = gt_masks.shape[-2:]
+                preds = model(images, extrinsics, intrinsics, timestamps)
+                assign_maps = preds["assign_maps"]                # [B, P, H_p, W_p]
+                _, P, H_p, W_p = assign_maps.shape
 
-            pred_up = F.interpolate(assign_maps, (H, W), mode="bilinear", align_corners=False)
+                is_dead = detect_dead_slots(assign_maps)          # [B, P]
 
-            # Argmax assignment: each pixel → slot with highest probability.
-            # This is mutually exclusive and consistent with binary GT masks.
-            pred_argmax = pred_up.argmax(dim=1)   # [B, H, W]  slot index per pixel
-            arange_p = torch.arange(P, device=device).view(1, P, 1, 1)
-            pred_bin = (arange_p == pred_argmax.unsqueeze(1)).float()   # [B, P, H, W]
+                # Hungarian matching on frame-0 assign_maps vs frame-0 GT
+                gt_masks_f0 = (part_masks_raw[:, 0] > 0.5).float()   # [B, P_gt, H, W]
+                pred_up_f0  = F.interpolate(assign_maps, (H, W),
+                                            mode="bilinear", align_corners=False)
+                matches = batch_hungarian_match(pred_up_f0, gt_masks_f0)
 
-            # Hungarian matching: align pred slots → GT parts
-            matches = batch_hungarian_match(pred_up, gt_masks)   # list[(pred_idx, gt_idx)]
+                if not is_phase1b:
+                    # ── Phase 1a: assign_maps vs frame-0 GT ─────────────────
+                    pred_argmax = pred_up_f0.argmax(dim=1)        # [B, H, W]
+                    arange_p = torch.arange(P, device=device).view(1, P, 1, 1)
+                    pred_bin = (arange_p == pred_argmax.unsqueeze(1)).float()  # [B, P, H, W]
 
-            for b in range(B):
-                pred_idx, gt_idx = matches[b]
-                for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
-                    inter = (pred_bin[b, pi] * gt_masks[b, gi]).sum()
-                    union = (pred_bin[b, pi] + gt_masks[b, gi]).clamp(0, 1).sum()
-                    iou_sum += (inter / (union + 1e-6)).item()
-                    count += 1
+                    for b in range(B):
+                        pred_idx, gt_idx = matches[b]
+                        for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+                            if is_dead[b, pi]:
+                                continue
+                            gt_m = gt_masks_f0[b, gi]
+                            if gt_m.sum() < 1:
+                                continue
+                            inter = (pred_bin[b, pi] * gt_m).sum()
+                            union = (pred_bin[b, pi] + gt_m).clamp(0, 1).sum()
+                            iou_sum += (inter / (union + 1e-6)).item()
+                            count += 1
+
+                else:
+                    # ── Phase 1b: per-frame alpha-projection IoU ─────────────
+                    # For each matched (slot pi → GT part gi), project slot pi's
+                    # Gaussians to frame t's camera and compare alpha_map with
+                    # the GT part mask at frame t.  Averages over all S frames
+                    # and all matched pairs that have a non-empty GT for that frame.
+                    gs_mu          = preds["gs_mu"]               # [B, P, N_g, 3]
+                    gs_opacity     = preds["gs_opacity"]          # [B, P, N_g, 1]
+                    axis           = preds["axis"]                # [B, P, 3]
+                    pivot          = preds["pivot"]               # [B, P, 3]
+                    scalars        = preds["scalars"]             # [B, P, S]
+                    motion_logits  = preds["motion_type_logits"]  # [B, P, 2]
+
+                    patch_size    = 14
+                    sigma_patches = 0.8
+
+                    # Motion probs [B, P, 3]: [static, prismatic, revolute]
+                    mp2 = torch.softmax(motion_logits.float(), dim=-1)       # [B, P, 2]
+                    static_col = torch.zeros(B, P, 1, device=device, dtype=mp2.dtype)
+                    mp3 = torch.cat([static_col, mp2], dim=-1)               # [B, P, 3]
+                    mp3[:, 0] = torch.tensor([1., 0., 0.], device=device)    # slot 0 always static
+
+                    # Patch-centre grid [H_p, W_p, 2]
+                    gy = torch.arange(H_p, device=device, dtype=torch.float32) + 0.5
+                    gx = torch.arange(W_p, device=device, dtype=torch.float32) + 0.5
+                    grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
+                    grid = torch.stack([grid_x, grid_y], dim=-1)             # [H_p, W_p, 2]
+
+                    for t in range(S):
+                        E_c2w  = extrinsics[:, t]                 # [B, 4, 4]
+                        R_w2c  = E_c2w[:, :3, :3].transpose(-1, -2)
+                        t_w2c  = -torch.einsum('bij,bj->bi', R_w2c, E_c2w[:, :3, 3])
+                        K      = intrinsics                       # [B, 3, 3]
+                        sc_t   = scalars[:, :, t]                 # [B, P]
+
+                        for b in range(B):
+                            pred_idx, gt_idx = matches[b]
+                            for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+                                if is_dead[b, pi]:
+                                    continue
+                                gt_bin = (part_masks_raw[b, t, gi] > 0.5).float()
+                                if gt_bin.sum() < 1:
+                                    continue
+
+                                # Project slot pi's Gaussians at frame t
+                                mu_p  = gs_mu[b, pi]              # [N_g, 3]
+                                N_g   = mu_p.shape[0]
+                                rot_p = torch.zeros(N_g, 4, device=device)
+                                rot_p[:, 0] = 1.0                 # identity quats
+
+                                mu_t, _ = apply_rigid_transform(
+                                    mu_p, rot_p,
+                                    mp3[b, pi], axis[b, pi], pivot[b, pi], sc_t[b, pi],
+                                )                                 # [N_g, 3] world coords
+
+                                # World → camera
+                                mu_cam = (R_w2c[b] @ mu_t.T + t_w2c[b].unsqueeze(-1)).T
+                                behind = mu_cam[:, 2] >= 0.0
+                                depth  = (-mu_cam[:, 2]).clamp(min=0.01)
+
+                                fx = K[b, 0, 0] / patch_size
+                                fy = K[b, 1, 1] / patch_size
+                                cx_k = K[b, 0, 2] / patch_size
+                                cy_k = K[b, 1, 2] / patch_size
+                                u = fx * mu_cam[:, 0] / depth + cx_k   # [N_g]
+                                v = fy * mu_cam[:, 1] / depth + cy_k
+
+                                # Soft alpha map [H_p, W_p] via Gaussian kernels
+                                dx    = grid[..., 0].unsqueeze(-1) - u.view(1, 1, -1)
+                                dy    = grid[..., 1].unsqueeze(-1) - v.view(1, 1, -1)
+                                kern  = torch.exp(-(dx*dx + dy*dy) / (2 * sigma_patches**2))
+                                op    = gs_opacity[b, pi].squeeze(-1) * (~behind).float()
+                                alpha = (kern * op.view(1, 1, -1)).sum(-1).clamp(0, 1)
+
+                                # Upsample to image resolution → binary IoU
+                                alpha_up = F.interpolate(
+                                    alpha.unsqueeze(0).unsqueeze(0),
+                                    (H, W), mode='bilinear', align_corners=False,
+                                ).squeeze()
+                                pred_bin = (alpha_up > 0.5).float()
+
+                                inter = (pred_bin * gt_bin).sum()
+                                union = (pred_bin + gt_bin).clamp(0, 1).sum()
+                                iou_sum += (inter / (union + 1e-6)).item()
+                                count   += 1
     finally:
-        model.train()   # always restore training mode
+        model.train()
 
     return iou_sum / max(count, 1)
 
@@ -1063,6 +1163,17 @@ def main(cfg: argparse.Namespace):
                 f"{k}={v.item():.4f}" for k, v in loss_dict.items()
             )
             print(f"[step {step:6d}] {loss_str}  lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
+
+        # ── Phase 1b per-frame IoU logging ────────────────────────────────
+        if warmup_done and cfg.phase != "1a" and (step % cfg.val_interval == 0):
+            if is_main:
+                mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
+                print(f"[step {step}] per-frame val IoU = {mean_iou:.4f}", flush=True)
+                iou_tensor = torch.tensor(mean_iou, device=device)
+            else:
+                iou_tensor = torch.zeros(1, device=device)
+            if is_dist:
+                dist.broadcast(iou_tensor, src=0)
 
         # ── Warmup gate ───────────────────────────────────────────────────
         if (not warmup_done) and (step % cfg.val_interval == 0):
