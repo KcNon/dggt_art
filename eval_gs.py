@@ -206,7 +206,7 @@ def evaluate_gs_scene(
     H_p = H // patch_size
     W_p = W // patch_size
 
-    with torch.amp.autocast("cuda", enabled=torch.cuda.is_available()):
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
         preds = model(images, extrinsics, intrinsics, timestamps)
 
     # Unpack predictions (batch dim 0), ensure float32 (autocast可能产出fp16)
@@ -364,6 +364,8 @@ def evaluate_gs_scene(
         "_scalars":           scalars_pred.cpu(),    # [P, S]
         "_bbox_center":       bc.cpu(),              # [P, 3]
         "_bbox_size":         bs.cpu(),              # [P, 3]
+        "_axis_pred":         axis_pred.cpu(),       # [P, 3]
+        "_pivot_pred":        pivot_pred.cpu(),      # [P, 3]
     }
 
 
@@ -535,6 +537,114 @@ def save_canonical_vis(result: dict, out_path: str):
 
 
 # ============================================================================
+# PLY 导出: canonical + per-frame world (按 slot 着色)
+# ============================================================================
+
+def _write_ply(
+    xyz:   np.ndarray,   # [N, 3] float
+    rgb:   np.ndarray,   # [N, 3] uint8
+    path:  str,
+) -> None:
+    assert xyz.shape[0] == rgb.shape[0]
+    n = xyz.shape[0]
+    header = (
+        "ply\n"
+        "format ascii 1.0\n"
+        f"element vertex {n}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        "end_header\n"
+    )
+    lines = [
+        f"{xyz[i,0]:.6f} {xyz[i,1]:.6f} {xyz[i,2]:.6f} "
+        f"{int(rgb[i,0])} {int(rgb[i,1])} {int(rgb[i,2])}"
+        for i in range(n)
+    ]
+    with open(path, "w") as f:
+        f.write(header)
+        f.write("\n".join(lines))
+        f.write("\n")
+
+
+def _stack_slots_colored(
+    points_per_slot: list,    # list of [N_g, 3] np arrays
+    opacities:       list,    # list of [N_g] np arrays
+    op_thresh:       float = 0.02,
+) -> tuple:
+    """Stack slot points, color each by SLOT_COLORS, filter low opacity."""
+    xyz_all, rgb_all = [], []
+    for p, (mu, op) in enumerate(zip(points_per_slot, opacities)):
+        keep = op > op_thresh
+        if keep.sum() == 0:
+            continue
+        col = SLOT_COLORS[p % len(SLOT_COLORS)]
+        rgb = np.tile((col * 255).astype(np.uint8)[None, :], (int(keep.sum()), 1))
+        xyz_all.append(mu[keep])
+        rgb_all.append(rgb)
+    if not xyz_all:
+        return np.zeros((0, 3), np.float32), np.zeros((0, 3), np.uint8)
+    return np.concatenate(xyz_all, 0), np.concatenate(rgb_all, 0)
+
+
+def save_canonical_ply(result: dict, out_path: str, op_thresh: float = 0.02) -> int:
+    """Export canonical-space GS centres, colored per slot."""
+    gs_mu      = result["_gs_mu"].numpy()        # [P, N_g, 3]
+    gs_opacity = result["_gs_opacity"].numpy()   # [P, N_g]
+    P = gs_mu.shape[0]
+    xyz, rgb = _stack_slots_colored(
+        [gs_mu[p] for p in range(P)],
+        [gs_opacity[p] for p in range(P)],
+        op_thresh=op_thresh,
+    )
+    _write_ply(xyz, rgb, out_path)
+    return xyz.shape[0]
+
+
+def save_world_ply(
+    result:    dict,
+    out_path:  str,
+    frame_idx: int,
+    op_thresh: float = 0.02,
+) -> int:
+    """Apply per-slot rigid transform at given frame, export world-space PLY."""
+    from dggt.utils.rigid_transform import apply_rigid_transform
+
+    gs_mu        = result["_gs_mu"]              # [P, N_g, 3]
+    gs_opacity   = result["_gs_opacity"].numpy() # [P, N_g]
+    motion_probs = result["_motion_probs"]       # [P, 3]
+    axis_pred    = result["_axis_pred"]          # [P, 3]
+    pivot_pred   = result["_pivot_pred"]         # [P, 3]
+    scalars      = result["_scalars"]            # [P, S]
+    P, N_g, _    = gs_mu.shape
+
+    pts_per_slot = []
+    for p in range(P):
+        dummy_q = torch.zeros(N_g, 4, dtype=gs_mu.dtype)
+        dummy_q[:, 0] = 1.0
+        world_pts, _ = apply_rigid_transform(
+            points            = gs_mu[p],
+            quats             = dummy_q,
+            motion_type_probs = motion_probs[p],
+            axis              = axis_pred[p],
+            pivot             = pivot_pred[p],
+            scalar            = scalars[p, frame_idx],
+        )
+        pts_per_slot.append(world_pts.detach().cpu().numpy())
+
+    xyz, rgb = _stack_slots_colored(
+        pts_per_slot,
+        [gs_opacity[p] for p in range(P)],
+        op_thresh=op_thresh,
+    )
+    _write_ply(xyz, rgb, out_path)
+    return xyz.shape[0]
+
+
+# ============================================================================
 # 全局指标直方图
 # ============================================================================
 
@@ -637,9 +747,12 @@ def main(cfg):
     out_dir  = Path(cfg.output_dir)
     vis_dir  = out_dir / "per_scene"
     can_dir  = out_dir / "canonical"
+    ply_dir  = out_dir / "ply"
     out_dir.mkdir(parents=True, exist_ok=True)
     vis_dir.mkdir(exist_ok=True)
     can_dir.mkdir(exist_ok=True)
+    if cfg.export_ply:
+        ply_dir.mkdir(exist_ok=True)
 
     # ── Load checkpoint ────────────────────────────────────────────────────
     print(f"Loading: {cfg.checkpoint}")
@@ -742,6 +855,22 @@ def main(cfg):
             # Canonical点云图
             save_canonical_vis(result, str(can_dir / f"{safe_id}.png"))
 
+            # PLY 导出: canonical + 首/中/末帧 world
+            if cfg.export_ply:
+                n_can = save_canonical_ply(
+                    result, str(ply_dir / f"{safe_id}_canonical.ply")
+                )
+                S_frames = result["_scalars"].shape[1]
+                frames_to_dump = sorted(set([0, S_frames // 2, S_frames - 1]))
+                for fi in frames_to_dump:
+                    save_world_ply(
+                        result,
+                        str(ply_dir / f"{safe_id}_world_f{fi:02d}.ply"),
+                        frame_idx=fi,
+                    )
+                print(f"           ply: {n_can} canonical pts, "
+                      f"{len(frames_to_dump)} world frames")
+
     if not all_results:
         print("No results collected.")
         return
@@ -815,6 +944,8 @@ def parse_args():
                    help="保存可视化的场景数量上限")
     p.add_argument("--sigma",      type=float, default=0.8,
                    help="Gaussian kernel sigma（patch单位，与训练一致）")
+    p.add_argument("--export_ply", action="store_true",
+                   help="导出 canonical + per-frame world PLY (按 slot 着色)")
     return p.parse_args()
 
 

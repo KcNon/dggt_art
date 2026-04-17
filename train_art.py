@@ -668,8 +668,8 @@ def compute_loss(
     loss_dict["dead_opacity"] = l_dead_op
 
     # ── Build sign-corrected axis/scalar in prediction-slot order ────────
-    # Both local and global render losses index by prediction slot, not GT order.
-    # Recompute sign flip in pred-slot order to avoid conflicting gradients.
+    # global_render_loss (gsplat) composites a single RGB frame, so slot
+    # order is irrelevant and it uses pred-slot inputs.
     P_pred = preds["axis"].shape[1]
     flip_mask = preds["axis"].new_zeros(B, P_pred, 1)   # [B, P, 1], no grad
     for b, (pred_idx, gt_idx) in enumerate(matches):
@@ -679,20 +679,60 @@ def compute_loss(
     axis_for_render   = preds["axis"]    * (1.0 - 2.0 * flip_mask)   # [B, P, 3]
     scalar_for_render = preds["scalars"] * (1.0 - 2.0 * flip_mask)   # [B, P, S]
 
+    # ── Reorder pred tensors to GT-slot order for slot-index-direct losses ─
+    # per_part_alpha_render_loss and bbox_loss supervise pred slot p against
+    # GT channel p. Without reordering this conflicts with Hungarian (which
+    # permutes assign_maps freely), causing all non-background slots to drift
+    # dead — confirmed at ckpt_074000 where only slot 0 had opacity > 0.
+    # Reorder pred tensors into GT order; unmatched GT channels (padding for
+    # scenes with fewer joints than max_parts) are zero-filled and marked
+    # dead so the loss skips them. Slot 0 is pass-through (background, not
+    # in matches by design).
+    def _to_gt_order(t: torch.Tensor) -> torch.Tensor:
+        out = reorder_by_match(t, matches, P_gt)
+        out[:, 0] = t[:, 0]
+        return out
+
+    gs_mu_gt       = _to_gt_order(preds["gs_mu"])              # [B, P_gt, N_g, 3]
+    gs_opacity_gt  = _to_gt_order(preds["gs_opacity"])         # [B, P_gt, N_g, 1]
+    pivot_gt       = _to_gt_order(preds["pivot"])              # [B, P_gt, 3]
+    mtl_gt         = _to_gt_order(preds["motion_type_logits"]) # [B, P_gt, 2]
+    bbox_center_gt = _to_gt_order(preds["bbox_center"])        # [B, P_gt, 3]
+    bbox_size_gt   = _to_gt_order(preds["bbox_size"])          # [B, P_gt, 3]
+    # axis_fixed / scalar_fixed are already in GT order from match_and_fix;
+    # patch slot 0 with pred slot 0 (slot 0 is static so axis/scalar are
+    # unused, but keep a valid non-zero axis to avoid any 0/0 normalise path).
+    axis_gt         = axis_fixed.clone()
+    axis_gt[:, 0]   = preds["axis"][:, 0]
+    scalar_gt       = scalar_fixed.clone()
+    scalar_gt[:, 0] = preds["scalars"][:, 0]
+
+    # is_dead in GT order: unmatched GT slots → dead so loss skips them.
+    is_dead_gt = reorder_by_match(
+        is_dead.float().unsqueeze(-1), matches, P_gt
+    ).squeeze(-1).bool()
+    is_matched_gt = is_dead.new_zeros(B, P_gt, dtype=torch.bool)
+    for b, (_, gt_idx_b) in enumerate(matches):
+        if len(gt_idx_b) > 0:
+            is_matched_gt[b, gt_idx_b] = True
+    is_matched_gt[:, 0] = True
+    is_dead_gt = is_dead_gt | (~is_matched_gt)
+    is_dead_gt[:, 0] = is_dead[:, 0]
+
     # ── Per-part alpha rendering loss (local, differentiable, no gsplat) ─
     if cfg.w_render > 0.0 and render_extrinsics is not None:
-        gt_masks_seq = batch["part_masks"].to(device)   # [B, S, P, H, W]
+        gt_masks_seq = batch["part_masks"].to(device)   # [B, S, P_gt, H, W]
         l_render = cfg.w_render * per_part_alpha_render_loss(
-            gs_mu              = preds["gs_mu"],
-            gs_opacity         = preds["gs_opacity"],
-            motion_type_logits = preds["motion_type_logits"],
-            axis               = axis_for_render,
-            pivot              = preds["pivot"],
-            scalars            = scalar_for_render,
+            gs_mu              = gs_mu_gt,
+            gs_opacity         = gs_opacity_gt,
+            motion_type_logits = mtl_gt,
+            axis               = axis_gt,
+            pivot              = pivot_gt,
+            scalars            = scalar_gt,
             extrinsics         = render_extrinsics,
             intrinsics         = batch["intrinsics"].to(device),
             gt_masks_seq       = gt_masks_seq,
-            is_dead            = is_dead,
+            is_dead            = is_dead_gt,
             patch_size         = 14,
         )
     else:
@@ -722,11 +762,11 @@ def compute_loss(
         l_render_global = preds["gs_mu"].new_zeros(1).squeeze()
     loss_dict["render_global"] = l_render_global
 
-    # ── BBox centroid projection loss ─────────────────────────────────────
+    # ── BBox centroid projection loss (slot-index-direct, GT-ordered) ────
     if render_extrinsics is not None:
         l_bbox = cfg.w_bbox * bbox_loss(
-            bbox_center = preds["bbox_center"],
-            bbox_size   = preds["bbox_size"],
+            bbox_center = bbox_center_gt,
+            bbox_size   = bbox_size_gt,
             assign_maps = assign_maps,
             extrinsics  = render_extrinsics,
             intrinsics  = batch["intrinsics"].to(device),
@@ -1051,11 +1091,13 @@ def main(cfg: argparse.Namespace):
         num_workers = cfg.num_workers,
         pin_memory  = True,
     )
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_dist else None
     val_loader = DataLoader(
         val_dataset,
         batch_size  = cfg.batch_size,
         shuffle     = False,
-        num_workers = 2,
+        sampler     = val_sampler,
+        num_workers = cfg.num_workers,
     )
 
     # ── Optimiser ──────────────────────────────────────────────────────────
