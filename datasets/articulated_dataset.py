@@ -73,6 +73,40 @@ def _load_mask(path: str, target_w: int, target_h: int) -> torch.Tensor:
     return (t > 0.5).float()
 
 
+def _load_depth(path: str, target_w: int, target_h: int) -> Optional[torch.Tensor]:
+    """Load depth as .npy (float32 meters). Resize bilinearly to target. None if missing."""
+    if not os.path.exists(path):
+        return None
+    d = np.load(path).astype(np.float32)
+    if d.ndim == 3:
+        d = d[..., 0]
+    t = torch.from_numpy(d).unsqueeze(0).unsqueeze(0)        # [1,1,h,w]
+    t = F.interpolate(t, size=(target_h, target_w),
+                      mode="bilinear", align_corners=False)
+    return t.squeeze(0).squeeze(0)                            # [H, W]
+
+
+def _pad_or_crop_tracks(arr: np.ndarray, target_n: int, fill: float = 0.0) -> np.ndarray:
+    """Pad or crop along the second axis (track axis) to target_n.
+
+    arr: [S, N, ...] or [N, ...]
+    Returns array with track axis = target_n.
+    """
+    track_axis = 1 if arr.ndim >= 3 else 0
+    cur = arr.shape[track_axis]
+    if cur == target_n:
+        return arr
+    if cur > target_n:
+        sl = [slice(None)] * arr.ndim
+        sl[track_axis] = slice(0, target_n)
+        return arr[tuple(sl)]
+    # pad
+    pad_shape = list(arr.shape)
+    pad_shape[track_axis] = target_n - cur
+    pad = np.full(pad_shape, fill, dtype=arr.dtype)
+    return np.concatenate([arr, pad], axis=track_axis)
+
+
 def _adjust_intrinsics(K: np.ndarray,
                        orig_w: int, orig_h: int,
                        new_w: int, new_h: int) -> np.ndarray:
@@ -133,6 +167,8 @@ class ArticulatedDataset(Dataset):
         val_ratio: float = 0.15,
         split_seed: int = 42,
         exclude_cams: Optional[set] = None,
+        max_tracks: int = 4096,
+        patch_size: int = 14,
     ):
         super().__init__()
         self.data_root   = Path(data_root)
@@ -140,6 +176,8 @@ class ArticulatedDataset(Dataset):
         self.num_frames  = num_frames
         self.max_parts   = max_parts
         self.phase       = phase
+        self.max_tracks  = max_tracks
+        self.patch_size  = patch_size
         # cam_00 is the back-view in PartNet-Mobility; excluded by default.
         self._exclude_cams: set = exclude_cams if exclude_cams is not None else {"cam_00"}
         # Instance variables (NOT class variables) to avoid cross-instance clobbering
@@ -372,6 +410,98 @@ class ArticulatedDataset(Dataset):
                     pseudo_masks[s, 0] = (1.0 - dyn_union).clamp(0, 1)
                 has_pseudo = any_found
 
+        # ── Depth [S, H, W] ──────────────────────────────────────────────
+        # Layout: {data_dir}/depth/{fid}.npy (float32, world meters).
+        # Missing → zeros + has_depth=False (graceful for early-stage training).
+        depth_dir = data_dir / "depth"
+        depth_frames: list[torch.Tensor] = []
+        any_depth = False
+        for fid in frame_ids:
+            d = _load_depth(str(depth_dir / f"{fid}.npy"), W, H)
+            if d is None:
+                depth_frames.append(torch.zeros(H, W))
+            else:
+                depth_frames.append(d)
+                any_depth = True
+        depth = torch.stack(depth_frames)                          # [S, H, W]
+
+        # ── Precomputed motion data ──────────────────────────────────────
+        # Layout: {data_dir}/motion_cache.npz produced by
+        #   scripts/precompute_motion_data.py
+        # Contents (all numpy):
+        #   tracks_2d_norm  [S_full, N_raw, 2]   pixel coords / (W,H) ∈ [0,1]
+        #   tracks_3d       [S_full, N_raw, 3]   world coords (meters)
+        #   tracks_vis      [S_full, N_raw]      bool/float ∈ {0,1}
+        #   motion_mask     [P, H_p, W_p]        first-frame patch pseudo-label
+        #   track_part_label[N_raw, P]           per-track soft assignment
+        #   frame_ids       [S_full]             string ids matching disk frames
+        H_p = H // self.patch_size
+        W_p = W // self.patch_size
+        N_t = self.max_tracks
+        P   = self.max_parts
+
+        tracks_2d        = torch.zeros(S, N_t, 2)
+        tracks_3d        = torch.zeros(S, N_t, 3)
+        tracks_vis       = torch.zeros(S, N_t)
+        motion_mask      = torch.zeros(P, H_p, W_p)
+        track_part_label = torch.zeros(N_t, P)
+        has_motion_data  = False
+
+        cache_path = data_dir / "motion_cache.npz"
+        if cache_path.exists():
+            try:
+                cache = np.load(str(cache_path), allow_pickle=True)
+                cache_fids = [str(x) for x in cache["frame_ids"].tolist()]
+                fid2idx    = {f: i for i, f in enumerate(cache_fids)}
+
+                # Map currently selected frame_ids → cache indices (graceful skip)
+                sel_idx = [fid2idx[f] for f in frame_ids if f in fid2idx]
+                if len(sel_idx) == S:
+                    raw_t2d = cache["tracks_2d_norm"][sel_idx]   # [S, N_raw, 2]
+                    raw_t3d = cache["tracks_3d"][sel_idx]        # [S, N_raw, 3]
+                    raw_vis = cache["tracks_vis"][sel_idx]       # [S, N_raw]
+                    raw_lbl = cache["track_part_label"]          # [N_raw, P_cache]
+                    raw_msk = cache["motion_mask"]               # [P_cache, h, w]
+
+                    # Pad/crop track axis to N_t
+                    raw_t2d = _pad_or_crop_tracks(raw_t2d, N_t, fill=0.0)
+                    raw_t3d = _pad_or_crop_tracks(raw_t3d, N_t, fill=0.0)
+                    raw_vis = _pad_or_crop_tracks(raw_vis, N_t, fill=0.0)
+                    raw_lbl = _pad_or_crop_tracks(raw_lbl, N_t, fill=0.0)
+
+                    # Convert normalized 2D → pixel coords in current resolution
+                    tracks_2d  = torch.from_numpy(raw_t2d).float()
+                    tracks_2d[..., 0] *= W
+                    tracks_2d[..., 1] *= H
+                    tracks_3d  = torch.from_numpy(raw_t3d).float()
+                    tracks_vis = torch.from_numpy(raw_vis).float()
+
+                    # Pad/crop part axis to P
+                    P_cache = raw_lbl.shape[1]
+                    if P_cache < P:
+                        pad = np.zeros((N_t, P - P_cache), dtype=raw_lbl.dtype)
+                        raw_lbl = np.concatenate([raw_lbl, pad], axis=1)
+                    elif P_cache > P:
+                        raw_lbl = raw_lbl[:, :P]
+                    track_part_label = torch.from_numpy(raw_lbl).float()
+
+                    # Resize motion_mask to (P, H_p, W_p) if cache resolution differs
+                    P_cache, h_c, w_c = raw_msk.shape
+                    mm = torch.from_numpy(raw_msk).float().unsqueeze(0)  # [1,P_c,h,w]
+                    if (h_c, w_c) != (H_p, W_p):
+                        mm = F.interpolate(mm, size=(H_p, W_p),
+                                           mode="bilinear", align_corners=False)
+                    mm = mm.squeeze(0)                                    # [P_c,H_p,W_p]
+                    if P_cache < P:
+                        motion_mask[:P_cache] = mm
+                    else:
+                        motion_mask = mm[:P]
+
+                    has_motion_data = True
+            except Exception:
+                # Corrupt cache: fall back to zero placeholders.
+                has_motion_data = False
+
         # ── Timestamps ────────────────────────────────────────────────────
         if S == 1:
             timestamps = torch.zeros(1)
@@ -386,6 +516,14 @@ class ArticulatedDataset(Dataset):
             "part_masks":       part_masks,        # [S, P, H, W]
             "pseudo_masks":     pseudo_masks,      # [S, P, H, W]  (zeros if phase!="2")
             "has_pseudo_masks": has_pseudo,        # bool
+            "depth":            depth,             # [S, H, W]      (zeros if missing)
+            "has_depth":        any_depth,         # bool
+            "tracks_2d":        tracks_2d,         # [S, N_t, 2]    pixel coords (zeros if missing)
+            "tracks_3d":        tracks_3d,         # [S, N_t, 3]    world meters (zeros if missing)
+            "tracks_vis":       tracks_vis,        # [S, N_t]       (zeros if missing)
+            "motion_mask":      motion_mask,       # [P, H_p, W_p]  (zeros if missing)
+            "track_part_label": track_part_label,  # [N_t, P]       (zeros if missing)
+            "has_motion_data":  has_motion_data,   # bool
             "gt_motion_type":   gt_motion_type,    # [P]  long
             "gt_axis":          gt_axis,           # [P, 3]
             "gt_pivot":         gt_pivot,          # [P, 3]

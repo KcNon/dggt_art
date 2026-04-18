@@ -49,6 +49,7 @@ from dggt.utils.dead_slot_gating import (
     detect_dead_slots, slot_sparsity_loss, dead_slot_opacity_loss
 )
 from dggt.utils.hungarian_matching import match_and_fix, reorder_by_match
+from scipy.optimize import linear_sum_assignment
 from dggt.utils.rigid_transform import apply_rigid_transform
 from datasets.articulated_dataset import ArticulatedDataset
 
@@ -563,6 +564,92 @@ def global_render_loss(
     return total_loss / n_terms
 
 
+def motion_aux_loss(
+    assign_maps: torch.Tensor,       # [B, P, H_p, W_p]  softmax
+    motion_mask: torch.Tensor,       # [B, P, H_p, W_p]  soft pseudo-label (sum_P=1)
+    tracks_2d: torch.Tensor,         # [B, S, N, 2]      pixel coords at (H, W)
+    tracks_vis: torch.Tensor,        # [B, S, N]
+    track_part_label: torch.Tensor,  # [B, N, P]         soft pseudo-label (sum_P=1)
+    has_motion: torch.Tensor,        # [B]  bool
+    img_hw: tuple[int, int],
+    w_mask: float,
+    w_track: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Auxiliary motion supervision from precomputed pseudo-labels.
+
+    Hungarian-matches pred slots → pseudo slots (slot 0 forced static in
+    precompute). Then:
+      L_mask:  soft-CE(assign_maps, motion_mask_aligned)
+      L_track: soft-CE(sample(assign_maps, tracks_f0), track_part_label_aligned)
+    Samples without motion data contribute 0.
+    """
+    B, P, H_p, W_p = assign_maps.shape
+    H, W = img_hw
+    device = assign_maps.device
+    z = assign_maps.new_zeros(())
+
+    if not bool(has_motion.any()):
+        return z, z
+
+    l_mask_sum = z.clone()
+    l_trk_sum  = z.clone()
+    n_mask = 0
+    n_trk  = 0
+
+    for b in range(B):
+        if not bool(has_motion[b]):
+            continue
+        am_b = assign_maps[b]     # [P, H_p, W_p]
+        mm_b = motion_mask[b]     # [P, H_p, W_p]
+
+        # Hungarian alignment (argmax IoU, slots 0..P-1 both sides)
+        with torch.no_grad():
+            am_arg = am_b.argmax(0)
+            mm_arg = mm_b.argmax(0)
+            cost = torch.zeros(P, P, device=device)
+            for i in range(P):
+                ai = (am_arg == i)
+                for j in range(P):
+                    mj = (mm_arg == j)
+                    inter = (ai & mj).sum().float()
+                    union = (ai | mj).sum().float()
+                    cost[i, j] = 1.0 - inter / (union + 1e-6)
+            row, col = linear_sum_assignment(cost.cpu().numpy())
+        # perm[pred_slot_i] = pseudo_slot_j matched to it
+        perm = torch.as_tensor(col, dtype=torch.long, device=device)[
+            torch.argsort(torch.as_tensor(row, dtype=torch.long, device=device))
+        ]
+
+        # L_mask: align pseudo channels to pred channels then soft-CE
+        mm_aligned = mm_b[perm]                              # [P, H_p, W_p]
+        log_am = torch.log(am_b.clamp(min=1e-8))
+        l_mask_sum = l_mask_sum + -(mm_aligned * log_am).sum(0).mean()
+        n_mask += 1
+
+        # L_track: sample pred at frame-0 track positions
+        vis0 = tracks_vis[b, 0]                              # [N]
+        if float(vis0.sum()) < 1.0:
+            continue
+        pts = tracks_2d[b, 0]                                # [N, 2] pixel
+        gx = pts[:, 0] / max(W - 1, 1) * 2.0 - 1.0
+        gy = pts[:, 1] / max(H - 1, 1) * 2.0 - 1.0
+        grid = torch.stack([gx, gy], dim=-1).view(1, 1, -1, 2)
+        sampled = F.grid_sample(
+            am_b.unsqueeze(0), grid,
+            mode="bilinear", padding_mode="border", align_corners=True,
+        ).squeeze(0).squeeze(1).transpose(0, 1)              # [N, P]
+        tpl_aligned = track_part_label[b][:, perm]           # [N, P]
+        log_s = torch.log(sampled.clamp(min=1e-8))
+        per_trk = -(tpl_aligned * log_s).sum(-1)             # [N]
+        w = vis0
+        l_trk_sum = l_trk_sum + (per_trk * w).sum() / (w.sum() + 1e-6)
+        n_trk += 1
+
+    l_mask = l_mask_sum / max(n_mask, 1)
+    l_trk  = l_trk_sum  / max(n_trk, 1)
+    return w_mask * l_mask, w_track * l_trk
+
+
 # ============================================================================
 # Training loop
 # ============================================================================
@@ -635,9 +722,35 @@ def compute_loss(
     l_sparse = slot_sparsity_loss(assign_maps, sparsity_w)
     loss_dict["sparsity"] = l_sparse
 
+    # ── Auxiliary motion loss (precomputed pseudo-labels) ─────────────────
+    w_mm_max = getattr(cfg, "w_motion_mask", 0.0)
+    w_mt_max = getattr(cfg, "w_motion_track", 0.0)
+    if (w_mm_max > 0.0 or w_mt_max > 0.0) and "has_motion_data" in batch:
+        has_motion = batch["has_motion_data"]
+        if not torch.is_tensor(has_motion):
+            has_motion = torch.tensor(has_motion, dtype=torch.bool)
+        has_motion = has_motion.to(device)
+        ramp = min(1.0, step / max(getattr(cfg, "motion_warmup_steps", 1), 1))
+        l_mm, l_mt = motion_aux_loss(
+            assign_maps      = assign_maps,
+            motion_mask      = batch["motion_mask"].to(device),
+            tracks_2d        = batch["tracks_2d"].to(device),
+            tracks_vis       = batch["tracks_vis"].to(device),
+            track_part_label = batch["track_part_label"].to(device),
+            has_motion       = has_motion,
+            img_hw           = (H, W),
+            w_mask           = ramp * w_mm_max,
+            w_track          = ramp * w_mt_max,
+        )
+    else:
+        l_mm = assign_maps.new_zeros(()).squeeze()
+        l_mt = assign_maps.new_zeros(()).squeeze()
+    loss_dict["motion_mask"]  = l_mm
+    loss_dict["motion_track"] = l_mt
+
     if is_warmup:
-        # Warmup: only mask + sparsity losses
-        total = l_mask + l_sparse
+        # Warmup: only mask + sparsity losses (+ motion aux if enabled)
+        total = l_mask + l_sparse + l_mm + l_mt
         loss_dict["total"] = total
         return total, loss_dict
 
@@ -819,7 +932,8 @@ def compute_loss(
     total = (l_mask + l_sparse
              + kin_losses["type"] + kin_losses["axis"]
              + kin_losses["pivot"] + kin_losses["scalar"]
-             + l_dead_op + l_render + l_render_global + l_bbox + l_pseudo + l_pose)
+             + l_dead_op + l_render + l_render_global + l_bbox + l_pseudo + l_pose
+             + l_mm + l_mt)
     loss_dict["total"] = total
     return total, loss_dict
 
@@ -1338,6 +1452,16 @@ def parse_args():
                         "Trains CameraHead during Phase 1b using GT extrinsics.")
     p.add_argument("--l1_sparsity",     type=float, default=0.1)
     p.add_argument("--l1_sparsity_warmup", type=float, default=0.0)
+
+    # Auxiliary motion loss (patch + track pseudo-labels from motion_cache.npz).
+    # Adds on top of GT part_mask supervision; disabled by default.
+    p.add_argument("--w_motion_mask",  type=float, default=0.0,
+                   help="Weight for patch-level motion pseudo-mask CE. "
+                        "0 disables motion aux loss entirely.")
+    p.add_argument("--w_motion_track", type=float, default=0.0,
+                   help="Weight for track-level motion pseudo-label CE.")
+    p.add_argument("--motion_warmup_steps", type=int, default=5000,
+                   help="Linear ramp 0→1 of motion-loss scaling over this many steps.")
     p.add_argument("--gradient_checkpointing", action="store_true",
                    help="Enable gradient checkpointing on Aggregator attention blocks "
                         "to reduce activation memory at the cost of ~33%% extra compute. "
