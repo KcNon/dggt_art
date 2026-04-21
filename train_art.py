@@ -1184,6 +1184,7 @@ def main(cfg: argparse.Namespace):
         split        = "train",
         val_ratio    = cfg.val_ratio,
         exclude_cams = _exclude_cams,
+        motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
     )
     val_dataset = ArticulatedDataset(
         data_root    = val_data_root,
@@ -1194,6 +1195,7 @@ def main(cfg: argparse.Namespace):
         split        = "val",
         val_ratio    = cfg.val_ratio,
         exclude_cams = _exclude_cams,
+        motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
     )
 
     train_sampler = DistributedSampler(train_dataset) if is_dist else None
@@ -1462,6 +1464,10 @@ def parse_args():
                    help="Weight for track-level motion pseudo-label CE.")
     p.add_argument("--motion_warmup_steps", type=int, default=5000,
                    help="Linear ramp 0→1 of motion-loss scaling over this many steps.")
+    p.add_argument("--motion_cache_name", type=str, default="motion_cache.npz",
+                   help="Filename of per-cam motion cache. Use 'motion_cache_gt.npz' "
+                        "for the GT-mask-derived pseudo-labels, or 'motion_cache.npz' "
+                        "for the CoWTracker-derived ones.")
     p.add_argument("--gradient_checkpointing", action="store_true",
                    help="Enable gradient checkpointing on Aggregator attention blocks "
                         "to reduce activation memory at the cost of ~33%% extra compute. "

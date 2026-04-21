@@ -86,13 +86,17 @@ def _load_depth(path: str, target_w: int, target_h: int) -> Optional[torch.Tenso
     return t.squeeze(0).squeeze(0)                            # [H, W]
 
 
-def _pad_or_crop_tracks(arr: np.ndarray, target_n: int, fill: float = 0.0) -> np.ndarray:
-    """Pad or crop along the second axis (track axis) to target_n.
+def _pad_or_crop_tracks(arr: np.ndarray, target_n: int, fill: float = 0.0,
+                        track_axis: Optional[int] = None) -> np.ndarray:
+    """Pad or crop along the track axis to target_n.
 
-    arr: [S, N, ...] or [N, ...]
-    Returns array with track axis = target_n.
+    arr: [S, N, ...] or [N, ...] or [S, N] (vis)
+    If track_axis is None, infer: axis 0 for [N, P] (ndim==2 and shape[0]>shape[1]
+    ambiguous), so callers should pass it explicitly for 2D arrays.
+    Legacy default: ndim>=3 → axis 1, else axis 0.
     """
-    track_axis = 1 if arr.ndim >= 3 else 0
+    if track_axis is None:
+        track_axis = 1 if arr.ndim >= 3 else 0
     cur = arr.shape[track_axis]
     if cur == target_n:
         return arr
@@ -169,6 +173,7 @@ class ArticulatedDataset(Dataset):
         exclude_cams: Optional[set] = None,
         max_tracks: int = 4096,
         patch_size: int = 14,
+        motion_cache_name: str = "motion_cache.npz",
     ):
         super().__init__()
         self.data_root   = Path(data_root)
@@ -178,6 +183,7 @@ class ArticulatedDataset(Dataset):
         self.phase       = phase
         self.max_tracks  = max_tracks
         self.patch_size  = patch_size
+        self.motion_cache_name = motion_cache_name
         # cam_00 is the back-view in PartNet-Mobility; excluded by default.
         self._exclude_cams: set = exclude_cams if exclude_cams is not None else {"cam_00"}
         # Instance variables (NOT class variables) to avoid cross-instance clobbering
@@ -447,7 +453,7 @@ class ArticulatedDataset(Dataset):
         track_part_label = torch.zeros(N_t, P)
         has_motion_data  = False
 
-        cache_path = data_dir / "motion_cache.npz"
+        cache_path = data_dir / self.motion_cache_name
         if cache_path.exists():
             try:
                 cache = np.load(str(cache_path), allow_pickle=True)
@@ -464,10 +470,10 @@ class ArticulatedDataset(Dataset):
                     raw_msk = cache["motion_mask"]               # [P_cache, h, w]
 
                     # Pad/crop track axis to N_t
-                    raw_t2d = _pad_or_crop_tracks(raw_t2d, N_t, fill=0.0)
-                    raw_t3d = _pad_or_crop_tracks(raw_t3d, N_t, fill=0.0)
-                    raw_vis = _pad_or_crop_tracks(raw_vis, N_t, fill=0.0)
-                    raw_lbl = _pad_or_crop_tracks(raw_lbl, N_t, fill=0.0)
+                    raw_t2d = _pad_or_crop_tracks(raw_t2d, N_t, fill=0.0, track_axis=1)
+                    raw_t3d = _pad_or_crop_tracks(raw_t3d, N_t, fill=0.0, track_axis=1)
+                    raw_vis = _pad_or_crop_tracks(raw_vis, N_t, fill=0.0, track_axis=1)
+                    raw_lbl = _pad_or_crop_tracks(raw_lbl, N_t, fill=0.0, track_axis=0)
 
                     # Convert normalized 2D → pixel coords in current resolution
                     tracks_2d  = torch.from_numpy(raw_t2d).float()
