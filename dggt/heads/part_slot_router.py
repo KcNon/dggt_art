@@ -111,11 +111,21 @@ class CrossAttentionLayer(nn.Module):
 
 class SelfAttentionLayer(nn.Module):
     """
-    Joint self-attention over cat([image_tokens, slot_tokens]).
-    Both streams are updated. Flash Attention via F.sdpa.
+    Joint self-attention over cat([image_tokens, slot_tokens, (track_tokens)]).
+    All present streams are updated. Flash Attention via F.sdpa.
+
+    When `use_track_tokens=True`, an additional FFN branch (ffn_track) is
+    instantiated. Track tokens are optional at forward time: if not provided,
+    the layer behaves exactly as the 2-stream version.
     """
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int = 4):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: int = 4,
+        use_track_tokens: bool = False,
+    ):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -128,29 +138,111 @@ class SelfAttentionLayer(nn.Module):
 
         self.ffn_img  = _FFN(dim, mlp_ratio)
         self.ffn_slot = _FFN(dim, mlp_ratio)
+        self.ffn_track = _FFN(dim, mlp_ratio) if use_track_tokens else None
 
     def forward(
         self,
-        image_tokens: torch.Tensor,   # [B, N, D]
-        slot_tokens:  torch.Tensor,   # [B, P, D]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        image_tokens: torch.Tensor,                    # [B, N, D]
+        slot_tokens:  torch.Tensor,                    # [B, P, D]
+        track_tokens: torch.Tensor | None = None,      # [B, T, D]
+        track_mask:   torch.Tensor | None = None,      # [B, T] float/bool
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         B, N, D = image_tokens.shape
         P = slot_tokens.shape[1]
+        T = 0 if track_tokens is None else track_tokens.shape[1]
         H = self.num_heads
 
-        all_tokens = torch.cat([image_tokens, slot_tokens], dim=1)  # [B, N+P, D]
-        x   = self.norm(all_tokens)
-        qkv = self.qkv(x).reshape(B, N + P, 3, H, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]                            # each [B, H, N+P, d]
+        parts = [image_tokens, slot_tokens]
+        if T > 0:
+            parts.append(track_tokens)
+        all_tokens = torch.cat(parts, dim=1)           # [B, N+P+T, D]
+        L = N + P + T
 
-        out = F.scaled_dot_product_attention(q, k, v, scale=self.scale)
-        out = out.transpose(1, 2).reshape(B, N + P, D)
+        x   = self.norm(all_tokens)
+        qkv = self.qkv(x).reshape(B, L, 3, H, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]                # each [B, H, L, d]
+
+        attn_mask = None
+        if T > 0 and track_mask is not None:
+            # Keys that are padding (track_mask==0) should not be attended.
+            # Build additive bias: 0 for valid keys, -inf for padded track keys.
+            key_valid = torch.ones(B, L, device=all_tokens.device, dtype=torch.bool)
+            key_valid[:, N + P:] = track_mask > 0
+            bias = torch.zeros(B, 1, 1, L, device=all_tokens.device, dtype=q.dtype)
+            bias.masked_fill_(~key_valid.view(B, 1, 1, L), float("-inf"))
+            attn_mask = bias
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
+        out = out.transpose(1, 2).reshape(B, L, D)
         out = self.out_proj(out)
         all_tokens = all_tokens + out
 
-        img_out  = self.ffn_img(all_tokens[:, :N])
-        slot_out = self.ffn_slot(all_tokens[:, N:])
-        return img_out, slot_out
+        img_out  = self.ffn_img (all_tokens[:, :N])
+        slot_out = self.ffn_slot(all_tokens[:, N:N + P])
+        if T > 0:
+            track_out = self.ffn_track(all_tokens[:, N + P:])
+        else:
+            track_out = None
+        return img_out, slot_out, track_out
+
+
+class SlotTrackCrossAttn(nn.Module):
+    """
+    Q = slots, KV = track tokens. Cheap (P queries × T keys).
+    Output is residual-added to slots with a learnable LayerScale gate γ.
+    γ is init to 0 (near-identity bootstrap) but RECEIVES NON-ZERO GRADIENT
+    on step 0 (d/dγ = out), so the whole upstream chain (track_encoder,
+    q/k/v/out_proj) gets non-zero gradient and can adapt during track-warmup.
+
+    Strict zero-init of out_proj.weight instead would zero the upstream
+    gradient (d out/d input ∝ out_proj.weight = 0), freezing TrackEncoder.
+    """
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim  = dim // num_heads
+        self.scale     = self.head_dim ** -0.5
+
+        self.norm_q  = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.q_proj  = nn.Linear(dim, dim, bias=False)
+        self.k_proj  = nn.Linear(dim, dim, bias=False)
+        self.v_proj  = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        # LayerScale: per-channel learnable gate, init 0 → identity at step 0
+        # but gradient flows to out_proj/k_proj/v_proj/track_encoder via d/dγ.
+        self.gamma = nn.Parameter(torch.zeros(dim))
+
+    def forward(
+        self,
+        slots:       torch.Tensor,                 # [B, P, D]
+        tracks:      torch.Tensor,                 # [B, T, D]
+        track_mask:  torch.Tensor | None = None,   # [B, T]
+    ) -> torch.Tensor:
+        B, P, D = slots.shape
+        T = tracks.shape[1]
+        H = self.num_heads
+
+        q = self.q_proj(self.norm_q(slots))           # [B, P, D]
+        k = self.k_proj(self.norm_kv(tracks))         # [B, T, D]
+        v = self.v_proj(tracks)                        # [B, T, D]
+
+        q = q.reshape(B, P, H, self.head_dim).transpose(1, 2)   # [B,H,P,d]
+        k = k.reshape(B, T, H, self.head_dim).transpose(1, 2)
+        v = v.reshape(B, T, H, self.head_dim).transpose(1, 2)
+
+        attn_mask = None
+        if track_mask is not None:
+            key_valid = (track_mask > 0).view(B, 1, 1, T).expand(B, H, P, T)
+            bias = torch.zeros(B, H, P, T, device=slots.device, dtype=q.dtype)
+            bias.masked_fill_(~key_valid, float("-inf"))
+            attn_mask = bias
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, scale=self.scale)
+        out = out.transpose(1, 2).reshape(B, P, D)
+        return slots + self.gamma * self.out_proj(out)
 
 
 # ---------------------------------------------------------------------------
@@ -184,12 +276,15 @@ class PartSlotRouter(nn.Module):
         state_embed_dim: int = 64,
         patch_start_idx: int = 5,
         patch_size:      int = 14,
+        use_track_tokens: bool = False,
+        dim_track:       int = 1024,
     ):
         super().__init__()
         self.num_slots       = num_slots
         self.dim_slot        = dim_slot
         self.patch_start_idx = patch_start_idx
         self.patch_size      = patch_size
+        self.use_track_tokens = use_track_tokens
 
         # ── Timestamp → stage embedding ─────────────────────────────────
         self.state_embed = nn.Sequential(
@@ -217,7 +312,10 @@ class PartSlotRouter(nn.Module):
         self.layer_types: list[str]     = []
         for i in range(num_layers):
             if (i + 1) % 4 == 0:           # indices 3, 7, 11, ...
-                self.layers.append(SelfAttentionLayer(dim_slot, num_heads, mlp_ratio))
+                self.layers.append(SelfAttentionLayer(
+                    dim_slot, num_heads, mlp_ratio,
+                    use_track_tokens=use_track_tokens,
+                ))
                 self.layer_types.append("self")
             else:
                 self.layers.append(CrossAttentionLayer(dim_slot, num_heads, mlp_ratio))
@@ -225,7 +323,32 @@ class PartSlotRouter(nn.Module):
 
         self.slot_norm = nn.LayerNorm(dim_slot)
 
+        # ── Track-token ingress ─────────────────────────────────────────
+        if use_track_tokens:
+            # Project external track encoding dim → dim_slot (identity if equal)
+            if dim_track != dim_slot:
+                self.track_in_proj = nn.Linear(dim_track, dim_slot)
+            else:
+                self.track_in_proj = nn.Identity()
+            # Learnable "stream-type" embedding so self-attn can distinguish
+            # track tokens from image/slot tokens.
+            self.track_type_embed = nn.Parameter(torch.zeros(1, 1, dim_slot))
+
+            # Dedicated slot→track cross-attn inserted before the last cross
+            # layer. Q=slots, KV=tracks. Zero-init residual for safe bootstrap.
+            self.slot_track_fuse = SlotTrackCrossAttn(dim_slot, num_heads)
+        else:
+            self.track_in_proj   = None
+            self.track_type_embed = None
+            self.slot_track_fuse  = None
+
         self._init_weights()
+
+        # Re-zero SlotTrackCrossAttn.gamma after _init_weights (which would
+        # overwrite it via LayerNorm's ones_ path — γ is not an LN but a raw
+        # Parameter, still safer to explicitly re-zero here).
+        if self.slot_track_fuse is not None:
+            nn.init.zeros_(self.slot_track_fuse.gamma)
 
     # ------------------------------------------------------------------ #
 
@@ -249,6 +372,8 @@ class PartSlotRouter(nn.Module):
         timestamps:   torch.Tensor,              # [B, S]
         img_hw:       tuple[int, int] | None = None,
         slot_init:    torch.Tensor | None = None,  # [B, P, dim_slot] from Aggregator
+        track_tokens: torch.Tensor | None = None,  # [B, T, dim_track] from TrackEncoder
+        track_mask:   torch.Tensor | None = None,  # [B, T]  (1=valid, 0=pad)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -301,13 +426,27 @@ class PartSlotRouter(nn.Module):
         slots = slot_init                                           # [B, P, dim_slot]
         last_attn_weights: torch.Tensor | None = None
 
+        # ── Track tokens: project + add type embedding ───────────────────
+        tr_tokens: torch.Tensor | None = None
+        if self.use_track_tokens and track_tokens is not None:
+            tr_tokens = self.track_in_proj(track_tokens)            # [B, T, dim_slot]
+            tr_tokens = tr_tokens + self.track_type_embed           # broadcast [1,1,D]
+
+        # Index of the last cross-attention layer (fuse slots with tracks just before it)
+        last_cross_idx = max(
+            (i for i, t in enumerate(self.layer_types) if t == "cross"),
+            default=-1,
+        )
+
         for i, (layer, ltype) in enumerate(zip(self.layers, self.layer_types)):
-            is_last_cross = (
-                ltype == "cross"
-                and all(t == "self" for t in self.layer_types[i + 1:])
-                    or i == len(self.layers) - 1 and ltype == "cross"
-            )
-            # We need weights only from the last cross-attn layer
+            # Inject slot↔track fusion immediately before the last cross-attn
+            if (
+                i == last_cross_idx
+                and self.slot_track_fuse is not None
+                and tr_tokens is not None
+            ):
+                slots = self.slot_track_fuse(slots, tr_tokens, track_mask)
+
             want_weights = (
                 ltype == "cross"
                 and not any(t == "cross" for t in self.layer_types[i + 1:])
@@ -319,8 +458,10 @@ class PartSlotRouter(nn.Module):
                 )
                 if want_weights and weights is not None:
                     last_attn_weights = weights   # [B, S*N, P]
-            else:  # self
-                image_tokens, slots = layer(image_tokens, slots)
+            else:  # self — joint 2/3-stream
+                image_tokens, slots, tr_tokens = layer(
+                    image_tokens, slots, tr_tokens, track_mask,
+                )
 
         slot_features = self.slot_norm(slots)                       # [B, P, dim_slot]
 

@@ -469,11 +469,21 @@ class ArticulatedDataset(Dataset):
                     raw_lbl = cache["track_part_label"]          # [N_raw, P_cache]
                     raw_msk = cache["motion_mask"]               # [P_cache, h, w]
 
-                    # Pad/crop track axis to N_t
-                    raw_t2d = _pad_or_crop_tracks(raw_t2d, N_t, fill=0.0, track_axis=1)
-                    raw_t3d = _pad_or_crop_tracks(raw_t3d, N_t, fill=0.0, track_axis=1)
-                    raw_vis = _pad_or_crop_tracks(raw_vis, N_t, fill=0.0, track_axis=1)
-                    raw_lbl = _pad_or_crop_tracks(raw_lbl, N_t, fill=0.0, track_axis=0)
+                    # Random subsample/pad along track axis — all arrays must
+                    # use the SAME index permutation so tracks stay aligned.
+                    N_raw = raw_t2d.shape[1]
+                    if N_raw >= N_t:
+                        perm = np.random.permutation(N_raw)[:N_t]
+                        raw_t2d = raw_t2d[:, perm]
+                        raw_t3d = raw_t3d[:, perm]
+                        raw_vis = raw_vis[:, perm]
+                        raw_lbl = raw_lbl[perm]
+                    else:
+                        # Zero-pad to N_t
+                        raw_t2d = _pad_or_crop_tracks(raw_t2d, N_t, fill=0.0, track_axis=1)
+                        raw_t3d = _pad_or_crop_tracks(raw_t3d, N_t, fill=0.0, track_axis=1)
+                        raw_vis = _pad_or_crop_tracks(raw_vis, N_t, fill=0.0, track_axis=1)
+                        raw_lbl = _pad_or_crop_tracks(raw_lbl, N_t, fill=0.0, track_axis=0)
 
                     # Convert normalized 2D → pixel coords in current resolution
                     tracks_2d  = torch.from_numpy(raw_t2d).float()

@@ -39,6 +39,7 @@ from dggt.heads.camera_head import CameraHead
 from dggt.heads.part_slot_router import PartSlotRouter
 from dggt.heads.articulation_head import ArticulationHead
 from dggt.heads.art_gaussian_head import ArtGaussianHead
+from dggt.heads.track_encoder import TrackEncoder
 from dggt.utils.plucker import compute_plucker_rays_patch, plucker_stop_gradient
 
 
@@ -69,12 +70,15 @@ class ArtVGGT(nn.Module):
         use_camera_head: bool = True,
         stop_gradient_plucker: bool = False,
         gradient_checkpointing: bool = False,
+        use_track_tokens: bool = False,
+        num_frames_track: int = 8,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.num_slots  = num_slots
         self.stop_gradient_plucker = stop_gradient_plucker
         self._gradient_checkpointing = gradient_checkpointing
+        self.use_track_tokens = use_track_tokens
 
         dim_agg = 2 * embed_dim     # Aggregator produces frame+global concat → 2×D
 
@@ -102,7 +106,20 @@ class ArtVGGT(nn.Module):
             num_slots=num_slots,
             patch_start_idx=self.patch_start_idx,
             patch_size=patch_size,
+            use_track_tokens=use_track_tokens,
+            dim_track=embed_dim,
         )
+
+        # ── Track encoder (optional) ───────────────────────────────────────
+        if use_track_tokens:
+            self.track_encoder = TrackEncoder(
+                num_frames=num_frames_track,
+                img_size=img_size,
+                dim_inner=512,
+                dim_out=embed_dim,
+            )
+        else:
+            self.track_encoder = None
 
         self.articulation_head = ArticulationHead(
             dim_in=embed_dim,
@@ -161,6 +178,8 @@ class ArtVGGT(nn.Module):
         extrinsics: torch.Tensor | None,       # [B, S, 4, 4] or None
         intrinsics: torch.Tensor,              # [B, 3, 3]
         timestamps: torch.Tensor,              # [B, S]
+        tracks_2d:  torch.Tensor | None = None,   # [B, S, N_t, 2] pixel coords
+        tracks_vis: torch.Tensor | None = None,   # [B, S, N_t]
     ) -> dict:
 
         if images.dim() == 4:
@@ -224,6 +243,16 @@ class ArtVGGT(nn.Module):
 
         preds["plucker_rays"] = plucker_rays
 
+        # ── 3b. Track encoder (optional) ───────────────────────────────────
+        track_tokens = None
+        track_mask   = None
+        if self.use_track_tokens and self.track_encoder is not None \
+                and tracks_2d is not None and tracks_vis is not None:
+            # Track mask: valid if visible in at least one frame
+            track_mask = (tracks_vis.sum(dim=1) > 0).float()     # [B, N_t]
+            track_tokens = self.track_encoder(tracks_2d, tracks_vis)  # [B, N_t, D]
+            preds["track_mask_valid_frac"] = track_mask.mean().detach()
+
         # ── 4. PartSlotRouter (decoder) ────────────────────────────────────
         slot_features, assign_maps = self.part_slot_router(
             image_tokens,
@@ -232,6 +261,8 @@ class ArtVGGT(nn.Module):
             timestamps,
             img_hw=(H, W),
             slot_init=slot_states,   # slot tokens pre-enriched by Aggregator global blocks
+            track_tokens=track_tokens,
+            track_mask=track_mask,
         )
         preds["slot_features"] = slot_features   # [B, P, D]
         preds["assign_maps"]   = assign_maps      # [B, P, H_p, W_p]
@@ -289,7 +320,8 @@ class ArtVGGT(nn.Module):
             for p in self.aggregator.parameters():
                 p.requires_grad_(True)
             for mod in [self.camera_head, self.part_slot_router,
-                        self.articulation_head, self.gaussian_head]:
+                        self.articulation_head, self.gaussian_head,
+                        self.track_encoder]:
                 if mod is not None:
                     for p in mod.parameters():
                         p.requires_grad_(True)
@@ -313,7 +345,8 @@ class ArtVGGT(nn.Module):
                 for p in layer.parameters():
                     p.requires_grad_(True)
             for mod in [self.camera_head, self.part_slot_router,
-                        self.articulation_head, self.gaussian_head]:
+                        self.articulation_head, self.gaussian_head,
+                        self.track_encoder]:
                 if mod is not None:
                     for p in mod.parameters():
                         p.requires_grad_(True)

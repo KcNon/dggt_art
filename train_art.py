@@ -970,7 +970,10 @@ def eval_mean_iou(model, val_loader, device, cfg) -> float:
                 part_masks_raw = batch["part_masks"].to(device)   # [B, S, P_gt, H, W]
                 B, S, P_gt, H, W = part_masks_raw.shape
 
-                preds = model(images, extrinsics, intrinsics, timestamps)
+                tracks_2d_b  = batch["tracks_2d"].to(device)  if getattr(cfg, "use_track_tokens", False) else None
+                tracks_vis_b = batch["tracks_vis"].to(device) if getattr(cfg, "use_track_tokens", False) else None
+                preds = model(images, extrinsics, intrinsics, timestamps,
+                              tracks_2d=tracks_2d_b, tracks_vis=tracks_vis_b)
                 assign_maps = preds["assign_maps"]                # [B, P, H_p, W_p]
                 _, P, H_p, W_p = assign_maps.shape
 
@@ -1120,6 +1123,8 @@ def main(cfg: argparse.Namespace):
         use_camera_head=True,
         stop_gradient_plucker=(cfg.phase == "2"),
         gradient_checkpointing=getattr(cfg, "gradient_checkpointing", False),
+        use_track_tokens=getattr(cfg, "use_track_tokens", False),
+        num_frames_track=cfg.num_frames,
     ).to(device)
 
     # Set initial phase and warmup state
@@ -1150,7 +1155,7 @@ def main(cfg: argparse.Namespace):
 
     if getattr(cfg, "reset_slot_tokens", False):
         with torch.no_grad():
-            nn.init.trunc_normal_(model.part_slot_router.slot_tokens, std=0.02)
+            nn.init.trunc_normal_(model.aggregator.slot_tokens, std=0.02)
         if is_main:
             print("Slot tokens re-initialized (reset_slot_tokens=True)")
 
@@ -1185,6 +1190,7 @@ def main(cfg: argparse.Namespace):
         val_ratio    = cfg.val_ratio,
         exclude_cams = _exclude_cams,
         motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
+        max_tracks        = cfg.max_tracks_per_sample,
     )
     val_dataset = ArticulatedDataset(
         data_root    = val_data_root,
@@ -1196,6 +1202,7 @@ def main(cfg: argparse.Namespace):
         val_ratio    = cfg.val_ratio,
         exclude_cams = _exclude_cams,
         motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
+        max_tracks        = cfg.max_tracks_per_sample,
     )
 
     train_sampler = DistributedSampler(train_dataset) if is_dist else None
@@ -1216,9 +1223,38 @@ def main(cfg: argparse.Namespace):
         num_workers = cfg.num_workers,
     )
 
-    # ── Optimiser ──────────────────────────────────────────────────────────
+    # ── Param groups (track params get separate LR) ────────────────────────
+    def _is_track_param(name: str) -> bool:
+        return (
+            name.startswith("track_encoder.")
+            or "part_slot_router.track_in_proj" in name
+            or "part_slot_router.track_type_embed" in name
+            or "part_slot_router.slot_track_fuse" in name
+            or ".ffn_track." in name
+        )
+
+    def _build_param_groups(m: nn.Module):
+        backbone, track_ps = [], []
+        for n, p in m.named_parameters():
+            if not p.requires_grad:
+                continue
+            (track_ps if _is_track_param(n) else backbone).append(p)
+        groups = [{"params": backbone, "lr": cfg.lr, "name": "backbone"}]
+        if len(track_ps) > 0:
+            groups.append({"params": track_ps,
+                           "lr": cfg.track_encoder_lr, "name": "track"})
+        return groups
+
+    # In the warmup-freeze window, freeze all non-track params so the newly-
+    # inserted track modules adapt from identity before backbone drift.
+    if getattr(cfg, "use_track_tokens", False) \
+            and start_step < cfg.freeze_track_warmup_steps:
+        for n, p in raw_model.named_parameters():
+            if not _is_track_param(n):
+                p.requires_grad_(False)
+
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        _build_param_groups(raw_model),
         lr           = cfg.lr,
         weight_decay = cfg.weight_decay,
     )
@@ -1288,8 +1324,12 @@ def main(cfg: argparse.Namespace):
 
         # BF16 autocast (bfloat16 has float32-range exponent → no overflow risk)
         # Falls back to float32 when use_bf16=False (legacy behaviour)
+        tracks_2d_b  = batch["tracks_2d"].to(device)  if getattr(cfg, "use_track_tokens", False) else None
+        tracks_vis_b = batch["tracks_vis"].to(device) if getattr(cfg, "use_track_tokens", False) else None
+
         with autocast("cuda", dtype=torch.bfloat16, enabled=getattr(cfg, "use_bf16", False)):
-            preds = model(images, extrinsics, intrinsics, timestamps)
+            preds = model(images, extrinsics, intrinsics, timestamps,
+                          tracks_2d=tracks_2d_b, tracks_vis=tracks_vis_b)
             loss, loss_dict = compute_loss(
                 preds, batch, step, cfg, is_warmup=(not warmup_done)
             )
@@ -1315,6 +1355,18 @@ def main(cfg: argparse.Namespace):
 
         step += 1
 
+        # ── Phase C track-warmup boundary: unfreeze backbone ──────────────
+        if (getattr(cfg, "use_track_tokens", False)
+                and step == cfg.freeze_track_warmup_steps):
+            # Re-apply phase freeze policy (unfreezes non-track backbone).
+            raw_model.set_phase(cfg.phase, warmup=(not warmup_done))
+            optimizer = torch.optim.AdamW(
+                _build_param_groups(raw_model),
+                lr=cfg.lr, weight_decay=cfg.weight_decay,
+            )
+            if is_main:
+                print(f"[step {step}] Phase C: track-warmup complete → backbone unfrozen")
+
         # ── Logging ───────────────────────────────────────────────────────
         if is_main and step % cfg.log_interval == 0:
             loss_str = "  ".join(
@@ -1324,28 +1376,28 @@ def main(cfg: argparse.Namespace):
 
         # ── Phase 1b per-frame IoU logging ────────────────────────────────
         if warmup_done and cfg.phase != "1a" and (step % cfg.val_interval == 0):
+            iou_tensor = torch.zeros((), device=device)
             if is_main:
                 mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
                 print(f"[step {step}] per-frame val IoU = {mean_iou:.4f}", flush=True)
-                iou_tensor = torch.tensor(mean_iou, device=device)
-            else:
-                iou_tensor = torch.zeros(1, device=device)
+                iou_tensor.fill_(mean_iou)
             if is_dist:
                 dist.broadcast(iou_tensor, src=0)
+                dist.barrier()
 
         # ── Warmup gate ───────────────────────────────────────────────────
         if (not warmup_done) and (step % cfg.val_interval == 0):
             # Run val only on rank 0 to avoid OOM from all ranks evaluating
             # simultaneously, which causes torchrun to restart all workers.
+            iou_tensor = torch.zeros((), device=device)
             if is_main:
                 mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
                 print(f"[step {step}] warmup val IoU = {mean_iou:.4f} "
                       f"(threshold {cfg.warmup_iou_threshold})")
-                iou_tensor = torch.tensor(mean_iou, device=device)
-            else:
-                iou_tensor = torch.zeros(1, device=device)
+                iou_tensor.fill_(mean_iou)
             if is_dist:
                 dist.broadcast(iou_tensor, src=0)
+                dist.barrier()
             mean_iou = iou_tensor.item()
 
             if mean_iou >= cfg.warmup_iou_threshold:
@@ -1375,7 +1427,7 @@ def main(cfg: argparse.Namespace):
                 # Do NOT recreate scaler — keep existing scale factor to avoid
                 # gradient overflow spikes from the newly-unfrozen heads.
                 optimizer = torch.optim.AdamW(
-                    filter(lambda p: p.requires_grad, model.parameters()),
+                    _build_param_groups(raw_model),
                     lr=cfg.lr, weight_decay=cfg.weight_decay,
                 )
 
@@ -1487,6 +1539,17 @@ def parse_args():
                    help="Start LR scheduler fresh from cfg.lr (ignore saved scheduler state)")
     p.add_argument("--reset_slot_tokens", action="store_true",
                    help="Re-init slot token embeddings after resume to break dominant-slot local minimum")
+
+    # ── Track-token (Phase C) ──────────────────────────────────────────────
+    p.add_argument("--use_track_tokens", action="store_true",
+                   help="Enable TrackEncoder + track-stream injection in PartSlotRouter.")
+    p.add_argument("--track_encoder_lr", type=float, default=3e-4,
+                   help="LR for TrackEncoder + new track-related PSR params.")
+    p.add_argument("--freeze_track_warmup_steps", type=int, default=5000,
+                   help="During first N steps, freeze backbone and train only "
+                        "track-related params (identity-to-adapted bootstrap).")
+    p.add_argument("--max_tracks_per_sample", type=int, default=1024,
+                   help="Fixed track count N passed to model (random subsample per iter).")
 
     return p.parse_args()
 

@@ -11,12 +11,11 @@ mkdir -p "${PHASE1A_DIR}"
 
 echo "[$(date)] Launching Phase 1a → ${PHASE1A_DIR}/train.log"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
-    --nproc_per_node=4 \
+CUDA_VISIBLE_DEVICES=3,4,5,6,7 torchrun \
+    --nproc_per_node=5 \
     --master_port=29503 \
     "${TRAIN_SCRIPT}" \
     --data_root             /data2/cyt/data_root_refine \
-    --resume                 /data2/cyt/checkpoints/art_v20_phase1a/ckpt_02000.pth \
     --output_dir            "${PHASE1A_DIR}" \
     --phase                 1a \
     --num_frames            8 \
@@ -37,12 +36,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --l1_sparsity           0.005 \
     --l1_sparsity_warmup    0.0 \
     --log_interval          50 \
-    --save_interval         2000 \
+    --save_interval         3000 \
     --val_interval          500 \
     --warmup_iou_threshold  0.8 \
     --gradient_checkpointing \
     --use_bf16 \
-    --num_workers           4 \
+    --num_workers           5 \
     --exclude_cam \
     --reset_scheduler \
     >> "${PHASE1A_DIR}/train.log" 2>&1
