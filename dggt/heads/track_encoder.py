@@ -28,6 +28,8 @@ For a static camera this reduces to original (xy - xy_0).
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -83,14 +85,28 @@ def _weighted_similarity_fit(
     return A, t
 
 
+def _fourier_encode(xy: torch.Tensor, freq_bands: torch.Tensor) -> torch.Tensor:
+    """
+    Sinusoidal positional encoding for 2D coords in [-1, 1].
+    xy: [..., 2]     freq_bands: [K]
+    Returns: [..., 4K]   ( sin/cos × x/y × K bands )
+    """
+    xy_f = xy.unsqueeze(-1) * freq_bands                         # [..., 2, K]
+    sc   = torch.cat([xy_f.sin(), xy_f.cos()], dim=-1)           # [..., 2, 2K]
+    return sc.flatten(-2)                                        # [..., 4K]
+
+
 def compute_dynamics_descriptor(
     tracks: torch.Tensor,   # [B, S, N, 2]  pixel coords
     vis:    torch.Tensor,   # [B, S, N]     0/1
     img_size: tuple[int, int],   # (H, W)
+    freq_bands: torch.Tensor | None = None,   # [K] for Fourier xy; None → raw xy
 ) -> torch.Tensor:
     """
-    Returns descriptor [B, N, F]  where F = 2S + 2S + 2S + 2S + 3
-      = [norm_xy | dxy | ddxy | residual_xy | stats]
+    Returns descriptor [B, N, F]:
+      with Fourier:  F = (4K + 2 + 2 + 2)·S + 3  = (4K+6)·S + 3
+      without:       F =  2·S  + 2·S + 2·S + 2·S + 3  = 8S + 3
+    Layout: [xy_enc | dxy | ddxy | residual_xy | vis_mean | res_std | track_len]
     """
     B, S, N, _ = tracks.shape
     H, W = img_size
@@ -140,15 +156,24 @@ def compute_dynamics_descriptor(
     def to_bnf(x):
         return x.permute(0, 2, 1, 3).reshape(B, N, 2 * S)
 
+    # Optional Fourier lift on absolute xy (dxy / ddxy / residual stay linear —
+    # they are difference quantities with inherent scale, Fourier is redundant).
+    if freq_bands is not None:
+        fb = freq_bands.to(device=device, dtype=dtype)
+        xy_enc = _fourier_encode(xy, fb)                              # [B,S,N,4K]
+        xy_feat = xy_enc.permute(0, 2, 1, 3).reshape(B, N, S * xy_enc.shape[-1])
+    else:
+        xy_feat = to_bnf(xy)                                          # 2S
+
     feat = torch.cat([
-        to_bnf(xy),          # 2S
+        xy_feat,             # S · 4K  or  2S
         to_bnf(dxy),         # 2S
         to_bnf(ddxy),        # 2S
         to_bnf(residual),    # 2S
         vis_mean.unsqueeze(-1),
         res_std.unsqueeze(-1),
         track_len.unsqueeze(-1),
-    ], dim=-1)               # [B, N, 8S + 3]
+    ], dim=-1)
     return feat
 
 
@@ -157,11 +182,15 @@ class TrackEncoder(nn.Module):
     Encode per-track dynamics into D_out-dim tokens.
 
     Args:
-        num_frames:   S (used to size input Linear)
-        img_size:     (H, W) for coord normalisation
-        dim_inner:    internal dim (default 512)
-        dim_out:      output dim, must match PSR dim_slot (default 1024)
-        mlp_ratio:    residual MLP expansion (default 4)
+        num_frames:     S (used to size input Linear)
+        img_size:       (H, W) for coord normalisation
+        dim_inner:      internal dim (default 512)
+        dim_out:        output dim, must match PSR dim_slot (default 1024)
+        mlp_ratio:      residual MLP expansion (default 4)
+        num_freq_bands: K; if >0 use Fourier lift on xy  (default 6)
+        dim_vis_feat:   if >0, TrackEncoder also accepts a per-track visual
+                        feature tensor (from frame-0 grid_sample on DINOv2
+                        features) and fuses it into proj_in. (default 0)
     """
 
     def __init__(
@@ -171,16 +200,31 @@ class TrackEncoder(nn.Module):
         dim_inner: int = 512,
         dim_out:   int = 1024,
         mlp_ratio: int = 4,
+        num_freq_bands: int = 6,
+        dim_vis_feat:   int = 0,
     ):
         super().__init__()
         self.num_frames = num_frames
         if isinstance(img_size, int):
             img_size = (img_size, img_size)
         self.img_size = tuple(img_size)
+        self.num_freq_bands = num_freq_bands
+        self.dim_vis_feat   = dim_vis_feat
 
-        F_in = 8 * num_frames + 3
+        # Fourier bands: π, 2π, 4π, …, 2^(K-1)·π  (covers scales 2.0 → 2/2^(K-1))
+        if num_freq_bands > 0:
+            bands = (2.0 ** torch.arange(num_freq_bands, dtype=torch.float32)) * math.pi
+            self.register_buffer("freq_bands", bands, persistent=False)
+            F_xy = 4 * num_freq_bands * num_frames           # per-frame 4K
+        else:
+            self.freq_bands = None
+            F_xy = 2 * num_frames                            # raw normalized xy
+
+        F_in = F_xy + 2 * num_frames * 3 + 3                 # dxy + ddxy + residual + 3 stats
+        F_in_total = F_in + dim_vis_feat                     # concat visual feat if enabled
+
         self.proj_in = nn.Sequential(
-            nn.Linear(F_in, dim_inner),
+            nn.Linear(F_in_total, dim_inner),
             nn.LayerNorm(dim_inner),
         )
         hidden = dim_inner * mlp_ratio
@@ -206,15 +250,25 @@ class TrackEncoder(nn.Module):
 
     def forward(
         self,
-        tracks: torch.Tensor,   # [B, S, N, 2]
-        vis:    torch.Tensor,   # [B, S, N]
+        tracks:   torch.Tensor,                  # [B, S, N, 2]
+        vis:      torch.Tensor,                  # [B, S, N]
+        vis_feat: torch.Tensor | None = None,    # [B, N, dim_vis_feat] or None
     ) -> torch.Tensor:
         B, S, N, _ = tracks.shape
         assert S == self.num_frames, (
             f"TrackEncoder built for S={self.num_frames} but got S={S}"
         )
-        feat = compute_dynamics_descriptor(tracks, vis, self.img_size)  # [B,N,F_in]
+        feat = compute_dynamics_descriptor(
+            tracks, vis, self.img_size,
+            freq_bands=self.freq_bands,
+        )                                          # [B,N,F_in]
+        if self.dim_vis_feat > 0:
+            assert vis_feat is not None and vis_feat.shape[-1] == self.dim_vis_feat, (
+                f"TrackEncoder built with dim_vis_feat={self.dim_vis_feat} but "
+                f"vis_feat is {None if vis_feat is None else vis_feat.shape}"
+            )
+            feat = torch.cat([feat, vis_feat.to(feat.dtype)], dim=-1)
         x = self.proj_in(feat)                    # [B,N,D_inner]
-        x = x + self.encoder(x)                    # residual MLP
-        x = self.proj_out(x)                       # [B,N,D_out]
+        x = x + self.encoder(x)                   # residual MLP
+        x = self.proj_out(x)                      # [B,N,D_out]
         return x

@@ -117,6 +117,8 @@ class ArtVGGT(nn.Module):
                 img_size=img_size,
                 dim_inner=512,
                 dim_out=embed_dim,
+                num_freq_bands=6,            # Fourier lift on xy
+                dim_vis_feat=embed_dim,      # frame-0 DINOv2 sample as anchor
             )
         else:
             self.track_encoder = None
@@ -180,6 +182,7 @@ class ArtVGGT(nn.Module):
         timestamps: torch.Tensor,              # [B, S]
         tracks_2d:  torch.Tensor | None = None,   # [B, S, N_t, 2] pixel coords
         tracks_vis: torch.Tensor | None = None,   # [B, S, N_t]
+        disable_tracks: bool = False,             # val-time ablation: same ckpt, no track injection
     ) -> dict:
 
         if images.dim() == 4:
@@ -246,11 +249,36 @@ class ArtVGGT(nn.Module):
         # ── 3b. Track encoder (optional) ───────────────────────────────────
         track_tokens = None
         track_mask   = None
-        if self.use_track_tokens and self.track_encoder is not None \
+        if self.use_track_tokens and not disable_tracks \
+                and self.track_encoder is not None \
                 and tracks_2d is not None and tracks_vis is not None:
             # Track mask: valid if visible in at least one frame
             track_mask = (tracks_vis.sum(dim=1) > 0).float()     # [B, N_t]
-            track_tokens = self.track_encoder(tracks_2d, tracks_vis)  # [B, N_t, D]
+
+            # Frame-0 visual anchor: grid_sample DINOv2 last-layer patches at
+            # each track's frame-0 pixel. Gives each track token a semantic
+            # prior ("this track starts on a door patch" / "on a wheel patch"),
+            # letting slot_track_fuse match semantics (not just geometry).
+            vis_feat = None
+            if getattr(self.track_encoder, "dim_vis_feat", 0) > 0:
+                D_dino = dino_tokens.shape[-1]
+                H_p = H // self.patch_size
+                W_p = W // self.patch_size
+                dino0 = dino_tokens[:, 0, patch_start_idx:, :]      # [B, N_p, D]
+                fmap  = dino0.reshape(B, H_p, W_p, D_dino).permute(0, 3, 1, 2)
+                # Normalise frame-0 track pixels to [-1, 1] for grid_sample
+                gx = tracks_2d[:, 0, :, 0] / max(W - 1, 1) * 2.0 - 1.0
+                gy = tracks_2d[:, 0, :, 1] / max(H - 1, 1) * 2.0 - 1.0
+                grid = torch.stack([gx, gy], dim=-1).unsqueeze(1)    # [B,1,N,2]
+                vis_feat = F.grid_sample(
+                    fmap.float(), grid.float(),
+                    mode="bilinear", padding_mode="border", align_corners=True,
+                ).squeeze(2).transpose(1, 2)                         # [B, N, D]
+                vis_feat = vis_feat.to(dino_tokens.dtype)
+
+            track_tokens = self.track_encoder(
+                tracks_2d, tracks_vis, vis_feat=vis_feat,
+            )                                                        # [B, N_t, D]
             preds["track_mask_valid_frac"] = track_mask.mean().detach()
 
         # ── 4. PartSlotRouter (decoder) ────────────────────────────────────

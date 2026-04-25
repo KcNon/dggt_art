@@ -943,7 +943,7 @@ def compute_loss(
 # ============================================================================
 
 @torch.no_grad()
-def eval_mean_iou(model, val_loader, device, cfg) -> float:
+def eval_mean_iou(model, val_loader, device, cfg, disable_tracks: bool = False) -> float:
     """Compute mean mask IoU over validation set.
 
     Phase 1a: assign_maps vs frame-0 GT (canonical rest state).
@@ -973,7 +973,8 @@ def eval_mean_iou(model, val_loader, device, cfg) -> float:
                 tracks_2d_b  = batch["tracks_2d"].to(device)  if getattr(cfg, "use_track_tokens", False) else None
                 tracks_vis_b = batch["tracks_vis"].to(device) if getattr(cfg, "use_track_tokens", False) else None
                 preds = model(images, extrinsics, intrinsics, timestamps,
-                              tracks_2d=tracks_2d_b, tracks_vis=tracks_vis_b)
+                              tracks_2d=tracks_2d_b, tracks_vis=tracks_vis_b,
+                              disable_tracks=disable_tracks)
                 assign_maps = preds["assign_maps"]                # [B, P, H_p, W_p]
                 _, P, H_p, W_p = assign_maps.shape
 
@@ -1372,14 +1373,32 @@ def main(cfg: argparse.Namespace):
             loss_str = "  ".join(
                 f"{k}={v.item():.4f}" for k, v in loss_dict.items()
             )
-            print(f"[step {step:6d}] {loss_str}  lr={scheduler.get_last_lr()[0]:.2e}", flush=True)
+            extra = ""
+            if getattr(cfg, "use_track_tokens", False):
+                psr = raw_model.part_slot_router
+                fuse = getattr(psr, "slot_track_fuse", None)
+                if fuse is not None:
+                    gamma_n = fuse.gamma.detach().float().norm().item()
+                    # Track-encoder grad norm (taken from current backward pass)
+                    te_params = [p for p in raw_model.track_encoder.parameters()
+                                 if p.grad is not None] if raw_model.track_encoder is not None else []
+                    te_g = (torch.stack([p.grad.detach().float().norm() for p in te_params]).norm().item()
+                            if te_params else 0.0)
+                    extra = f"  gamma={gamma_n:.3e}  te_grad={te_g:.3e}"
+            print(f"[step {step:6d}] {loss_str}  lr={scheduler.get_last_lr()[0]:.2e}{extra}", flush=True)
 
         # ── Phase 1b per-frame IoU logging ────────────────────────────────
         if warmup_done and cfg.phase != "1a" and (step % cfg.val_interval == 0):
             iou_tensor = torch.zeros((), device=device)
             if is_main:
                 mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
-                print(f"[step {step}] per-frame val IoU = {mean_iou:.4f}", flush=True)
+                msg = f"[step {step}] per-frame val IoU = {mean_iou:.4f}"
+                if getattr(cfg, "use_track_tokens", False):
+                    iou_no_tracks = eval_mean_iou(raw_model, val_loader, device, cfg,
+                                                  disable_tracks=True)
+                    gap = mean_iou - iou_no_tracks
+                    msg += f"  (no-tracks={iou_no_tracks:.4f}  gap={gap:+.4f})"
+                print(msg, flush=True)
                 iou_tensor.fill_(mean_iou)
             if is_dist:
                 dist.broadcast(iou_tensor, src=0)

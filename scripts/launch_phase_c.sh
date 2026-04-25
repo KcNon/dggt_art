@@ -15,7 +15,7 @@
 
 PHASE_C_DIR="/data2/cyt/checkpoints/art_v20_phase_c"
 TRAIN_SCRIPT="/home/yuantao/code/dggt_art/train_art.py"
-RESUME_CKPT="/data2/cyt/checkpoints/art_v20_phase1a/ckpt_021000.pth"
+RESUME_CKPT="/data2/cyt/checkpoints/art_v20_phase_c/ckpt_024000.pth"
 
 mkdir -p "${PHASE_C_DIR}"
 echo "[$(date)] Launching Phase C (phase=1b + tracks) from ${RESUME_CKPT} → ${PHASE_C_DIR}/train.log"
@@ -56,7 +56,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --freeze_track_warmup_steps  0 \
     --max_tracks_per_sample      1024 \
     --log_interval               50 \
-    --save_interval              3000 \
+    --save_interval              5000 \
     --val_interval               500 \
     --warmup_iou_threshold       0.8 \
     --gradient_checkpointing \
