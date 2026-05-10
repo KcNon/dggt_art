@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, ConcatDataset
 from torch.amp import GradScaler, autocast
 
 import os
@@ -52,6 +52,8 @@ from dggt.utils.hungarian_matching import match_and_fix, reorder_by_match
 from scipy.optimize import linear_sum_assignment
 from dggt.utils.rigid_transform import apply_rigid_transform
 from datasets.articulated_dataset import ArticulatedDataset
+from datasets.itaco_sim_dataset import iTACOSimDataset
+from datasets.itaco_real_dataset import iTACORealDataset
 
 
 # ============================================================================
@@ -754,6 +756,31 @@ def compute_loss(
         loss_dict["total"] = total
         return total, loss_dict
 
+    # If the batch lacks GT kinematics (e.g. real-data Phase 2 / iTACO),
+    # skip kin / bbox / render losses and rely on mask + motion aux + pose_enc.
+    has_kin_gt = bool(batch.get("has_kin_gt", True))
+    if not has_kin_gt:
+        # Pose-encoding loss only when GT pose exists (Polycam pose treated as GT-ish)
+        w_pose = getattr(cfg, "w_pose_enc", 0.0)
+        l_pose = assign_maps.new_zeros(()).squeeze()
+        if w_pose > 0.0 and "pose_enc" in preds and batch.get("has_pose", True):
+            from dggt.utils.pose_enc import extri_intri_to_pose_encoding
+            gt_c2w = batch["extrinsics"].to(device).float()
+            intr   = batch["intrinsics"].to(device).float()
+            R_c2w = gt_c2w[:, :, :3, :3]
+            t_c2w = gt_c2w[:, :, :3, 3:4]
+            R_w2c = R_c2w.transpose(-1, -2)
+            t_w2c = -R_w2c @ t_c2w
+            w2c_34 = torch.cat([R_w2c, t_w2c], dim=-1)
+            S_frames = gt_c2w.shape[1]
+            intr_bs = intr.unsqueeze(1).expand(-1, S_frames, -1, -1)
+            gt_pose_enc = extri_intri_to_pose_encoding(w2c_34, intr_bs, image_size_hw=(H, W))
+            l_pose = w_pose * F.mse_loss(preds["pose_enc"].float(), gt_pose_enc.detach())
+        loss_dict["pose_enc"] = l_pose
+        total = l_mask + l_sparse + l_mm + l_mt + l_pose
+        loss_dict["total"] = total
+        return total, loss_dict
+
     # ── Kinematic losses ──────────────────────────────────────────────────
     kin_losses = kinematic_loss(
         motion_type_logits = preds["motion_type_logits"],
@@ -943,21 +970,22 @@ def compute_loss(
 # ============================================================================
 
 @torch.no_grad()
-def eval_mean_iou(model, val_loader, device, cfg, disable_tracks: bool = False) -> float:
+def eval_mean_iou(model, val_loader, device, cfg, disable_tracks: bool = False):
     """Compute mean mask IoU over validation set.
 
-    Phase 1a: assign_maps vs frame-0 GT (canonical rest state).
-              Dead/empty slots are excluded.
-    Phase 1b: per-frame alpha-projection IoU — full pipeline
-              (assign_maps → GS → ArticulationHead(scalar_t) → project → mask_t)
-              compared against each frame's GT mask.
-              Dead slots and frames where GT is empty are excluded.
+    Returns dict:
+      assign : assign_map argmax IoU @ frame 0  (always computed)
+      alpha  : per-frame alpha-projection IoU through full GS pipeline
+               (Phase 1b only; equals NaN for Phase 1a since GS head is frozen)
+      primary: the metric used for warmup gate decisions / logging headline
+               (assign for Phase 1a; alpha for Phase 1b)
 
-    Hungarian matching aligns predicted slots to GT parts in both phases.
+    Hungarian matching aligns predicted slots to GT parts.
     """
     from dggt.utils.hungarian_matching import batch_hungarian_match
     model.eval()
-    iou_sum, count = 0.0, 0
+    alpha_sum, alpha_n = 0.0, 0
+    assign_sum, assign_n = 0.0, 0
     is_phase1b = (cfg.phase != "1a")
 
     try:
@@ -986,26 +1014,21 @@ def eval_mean_iou(model, val_loader, device, cfg, disable_tracks: bool = False) 
                                             mode="bilinear", align_corners=False)
                 matches = batch_hungarian_match(pred_up_f0, gt_masks_f0)
 
-                if not is_phase1b:
-                    # ── Phase 1a: assign_maps vs frame-0 GT ─────────────────
-                    pred_argmax = pred_up_f0.argmax(dim=1)        # [B, H, W]
-                    arange_p = torch.arange(P, device=device).view(1, P, 1, 1)
-                    pred_bin = (arange_p == pred_argmax.unsqueeze(1)).float()  # [B, P, H, W]
+                # ── ALWAYS: assign_map argmax IoU @ frame 0 ─────────────────
+                pred_argmax = pred_up_f0.argmax(dim=1)            # [B, H, W]
+                for b in range(B):
+                    pred_idx, gt_idx = matches[b]
+                    for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+                        if is_dead[b, pi]: continue
+                        gt_m = gt_masks_f0[b, gi]
+                        if gt_m.sum() < 1: continue
+                        pr_m  = (pred_argmax[b] == pi).float()
+                        inter = (pr_m * gt_m).sum()
+                        union = (pr_m + gt_m).clamp(0, 1).sum()
+                        assign_sum += (inter / (union + 1e-6)).item()
+                        assign_n   += 1
 
-                    for b in range(B):
-                        pred_idx, gt_idx = matches[b]
-                        for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
-                            if is_dead[b, pi]:
-                                continue
-                            gt_m = gt_masks_f0[b, gi]
-                            if gt_m.sum() < 1:
-                                continue
-                            inter = (pred_bin[b, pi] * gt_m).sum()
-                            union = (pred_bin[b, pi] + gt_m).clamp(0, 1).sum()
-                            iou_sum += (inter / (union + 1e-6)).item()
-                            count += 1
-
-                else:
+                if is_phase1b:
                     # ── Phase 1b: per-frame alpha-projection IoU ─────────────
                     # For each matched (slot pi → GT part gi), project slot pi's
                     # Gaussians to frame t's camera and compare alpha_map with
@@ -1088,12 +1111,15 @@ def eval_mean_iou(model, val_loader, device, cfg, disable_tracks: bool = False) 
 
                                 inter = (pred_bin * gt_bin).sum()
                                 union = (pred_bin + gt_bin).clamp(0, 1).sum()
-                                iou_sum += (inter / (union + 1e-6)).item()
-                                count   += 1
+                                alpha_sum += (inter / (union + 1e-6)).item()
+                                alpha_n   += 1
     finally:
         model.train()
 
-    return iou_sum / max(count, 1)
+    assign_iou = assign_sum / max(assign_n, 1)
+    alpha_iou  = (alpha_sum / max(alpha_n, 1)) if alpha_n > 0 else float("nan")
+    primary    = alpha_iou if is_phase1b else assign_iou
+    return {"primary": primary, "assign": assign_iou, "alpha": alpha_iou}
 
 
 # ============================================================================
@@ -1130,7 +1156,7 @@ def main(cfg: argparse.Namespace):
 
     # Set initial phase and warmup state
     is_warmup = (cfg.phase == "1a")
-    model.set_phase(cfg.phase, warmup=is_warmup)
+    model.set_phase(cfg.phase, warmup=is_warmup, n_unfreeze_blocks=cfg.n_unfreeze_blocks)
 
     _resume_ckpt = None
     if cfg.resume:
@@ -1170,43 +1196,75 @@ def main(cfg: argparse.Namespace):
 
     # ── Datasets ───────────────────────────────────────────────────────────
     ds_phase = "1" if cfg.phase in ("1a", "1b") else "2"
-
-    # Phase 2: use real data if provided, else fall back to synthetic
-    train_data_root = (
-        cfg.real_data_root
-        if cfg.phase == "2" and cfg.real_data_root is not None
-        else cfg.data_root
-    )
-    # Val always uses synthetic data (has GT masks for the warmup IoU gate)
-    val_data_root = cfg.data_root
-
     _exclude_cams = set(cfg.exclude_cams) if cfg.exclude_cams else set()
-    train_dataset = ArticulatedDataset(
-        data_root    = train_data_root,
-        target_size  = cfg.img_size,
-        num_frames   = cfg.num_frames,
-        max_parts    = 8,
-        phase        = ds_phase,
-        split        = "train",
-        val_ratio    = cfg.val_ratio,
-        exclude_cams = _exclude_cams,
-        motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
-        max_tracks        = cfg.max_tracks_per_sample,
-    )
-    val_dataset = ArticulatedDataset(
-        data_root    = val_data_root,
-        target_size  = cfg.img_size,
-        num_frames   = cfg.num_frames,
-        max_parts    = 8,
-        phase        = "1",   # always GT masks for validation
-        split        = "val",
-        val_ratio    = cfg.val_ratio,
-        exclude_cams = _exclude_cams,
-        motion_cache_name = getattr(cfg, "motion_cache_name", "motion_cache.npz"),
-        max_tracks        = cfg.max_tracks_per_sample,
-    )
+    motion_cache = getattr(cfg, "motion_cache_name", "motion_cache.npz")
 
-    train_sampler = DistributedSampler(train_dataset) if is_dist else None
+    def _build_legacy(data_root, split, phase_):
+        return ArticulatedDataset(
+            data_root=data_root, target_size=cfg.img_size,
+            num_frames=cfg.num_frames, max_parts=8,
+            phase=phase_, split=split, val_ratio=cfg.val_ratio,
+            exclude_cams=_exclude_cams,
+            motion_cache_name=motion_cache, max_tracks=cfg.max_tracks_per_sample,
+        )
+
+    def _build_itaco_sim(split):
+        return iTACOSimDataset(
+            data_root=cfg.data_root, target_size=cfg.img_size,
+            num_frames=cfg.num_frames, max_parts=8, max_tracks=cfg.max_tracks_per_sample,
+            split=split, val_ratio=cfg.val_ratio, random_start=(split == "train"),
+        )
+
+    def _build_itaco_real(split):
+        return iTACORealDataset(
+            data_root=cfg.real_data_root or cfg.data_root,
+            target_size=cfg.img_size, num_frames=cfg.num_frames,
+            max_parts=8, max_tracks=cfg.max_tracks_per_sample,
+            split=split, random_start=(split == "train"),
+        )
+
+    train_sampler = None
+    if cfg.dataset_type == "legacy":
+        train_data_root = (
+            cfg.real_data_root
+            if cfg.phase == "2" and cfg.real_data_root is not None
+            else cfg.data_root
+        )
+        train_dataset = _build_legacy(train_data_root, "train", ds_phase)
+        val_dataset   = _build_legacy(cfg.data_root, "val", "1")
+
+    elif cfg.dataset_type == "itaco_sim":
+        train_dataset = _build_itaco_sim("train")
+        val_dataset   = _build_itaco_sim("val")
+
+    elif cfg.dataset_type == "itaco_real":
+        train_dataset = _build_itaco_real("train")
+        # Val on iTACO sim so we get a GT-IoU signal during training.
+        val_dataset   = _build_itaco_sim("val")
+
+    elif cfg.dataset_type == "mixed":
+        sim_train  = _build_itaco_sim("train")
+        real_train = _build_itaco_real("all")    # only 4 real scenes total
+        # Repeat real dataset to ~real_mix_ratio of total size for
+        # balanced DistributedSampler.  (DDP requires a DistributedSampler,
+        # not WeightedRandomSampler — the latter has no set_epoch / rank-shard.)
+        n_real_total = max(1, int(len(sim_train) * float(cfg.real_mix_ratio) / (1.0 - float(cfg.real_mix_ratio))))
+        n_repeat = max(1, n_real_total // len(real_train))
+        real_repeat = ConcatDataset([real_train] * n_repeat)
+        if is_main:
+            print(f"[data] mixed: real repeated {n_repeat}× ({len(real_train)}→{len(real_repeat)})  "
+                  f"  real_frac≈{len(real_repeat)/(len(sim_train)+len(real_repeat)):.2f}")
+        train_dataset = ConcatDataset([sim_train, real_repeat])
+        val_dataset = _build_itaco_sim("val")
+    else:
+        raise ValueError(f"unknown --dataset_type {cfg.dataset_type}")
+
+    if is_main:
+        print(f"[data] dataset_type={cfg.dataset_type}  "
+              f"train={len(train_dataset)}  val={len(val_dataset)}")
+
+    if train_sampler is None:
+        train_sampler = DistributedSampler(train_dataset) if is_dist else None
     train_loader = DataLoader(
         train_dataset,
         batch_size  = cfg.batch_size,
@@ -1311,7 +1369,8 @@ def main(cfg: argparse.Namespace):
         except StopIteration:
             epoch += 1
             if is_dist:
-                train_sampler.set_epoch(epoch)
+                if hasattr(train_sampler, "set_epoch"):
+                    train_sampler.set_epoch(epoch)
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
@@ -1360,7 +1419,7 @@ def main(cfg: argparse.Namespace):
         if (getattr(cfg, "use_track_tokens", False)
                 and step == cfg.freeze_track_warmup_steps):
             # Re-apply phase freeze policy (unfreezes non-track backbone).
-            raw_model.set_phase(cfg.phase, warmup=(not warmup_done))
+            raw_model.set_phase(cfg.phase, warmup=(not warmup_done), n_unfreeze_blocks=cfg.n_unfreeze_blocks)
             optimizer = torch.optim.AdamW(
                 _build_param_groups(raw_model),
                 lr=cfg.lr, weight_decay=cfg.weight_decay,
@@ -1391,15 +1450,17 @@ def main(cfg: argparse.Namespace):
         if warmup_done and cfg.phase != "1a" and (step % cfg.val_interval == 0):
             iou_tensor = torch.zeros((), device=device)
             if is_main:
-                mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
-                msg = f"[step {step}] per-frame val IoU = {mean_iou:.4f}"
+                r = eval_mean_iou(raw_model, val_loader, device, cfg)
+                msg = (f"[step {step}] val  assign={r['assign']:.4f}  "
+                       f"alpha={r['alpha']:.4f}")
                 if getattr(cfg, "use_track_tokens", False):
-                    iou_no_tracks = eval_mean_iou(raw_model, val_loader, device, cfg,
-                                                  disable_tracks=True)
-                    gap = mean_iou - iou_no_tracks
-                    msg += f"  (no-tracks={iou_no_tracks:.4f}  gap={gap:+.4f})"
+                    rn = eval_mean_iou(raw_model, val_loader, device, cfg,
+                                       disable_tracks=True)
+                    msg += (f"   |  no-tracks: assign={rn['assign']:.4f} "
+                            f"alpha={rn['alpha']:.4f}   gap_assign={r['assign']-rn['assign']:+.4f}"
+                            f"  gap_alpha={r['alpha']-rn['alpha']:+.4f}")
                 print(msg, flush=True)
-                iou_tensor.fill_(mean_iou)
+                iou_tensor.fill_(r["primary"])
             if is_dist:
                 dist.broadcast(iou_tensor, src=0)
                 dist.barrier()
@@ -1410,10 +1471,10 @@ def main(cfg: argparse.Namespace):
             # simultaneously, which causes torchrun to restart all workers.
             iou_tensor = torch.zeros((), device=device)
             if is_main:
-                mean_iou = eval_mean_iou(raw_model, val_loader, device, cfg)
-                print(f"[step {step}] warmup val IoU = {mean_iou:.4f} "
+                r = eval_mean_iou(raw_model, val_loader, device, cfg)
+                print(f"[step {step}] warmup val IoU = {r['assign']:.4f} "
                       f"(threshold {cfg.warmup_iou_threshold})")
-                iou_tensor.fill_(mean_iou)
+                iou_tensor.fill_(r["primary"])      # primary == assign in Phase 1a
             if is_dist:
                 dist.broadcast(iou_tensor, src=0)
                 dist.barrier()
@@ -1428,7 +1489,7 @@ def main(cfg: argparse.Namespace):
                 warmup_done = True
                 if is_main:
                     print(f"[step {step}] Warmup complete → unfreezing all heads")
-                raw_model.set_phase(cfg.phase, warmup=False)
+                raw_model.set_phase(cfg.phase, warmup=False, n_unfreeze_blocks=cfg.n_unfreeze_blocks)
                 # Save checkpoint at warmup transition so Phase 1a weights are preserved
                 if is_main:
                     ckpt_path = Path(cfg.output_dir) / f"ckpt_warmup_{step:06d}.pth"
@@ -1480,6 +1541,18 @@ def parse_args():
     # Data
     p.add_argument("--data_root",       required=True)
     p.add_argument("--real_data_root",  default=None)
+    p.add_argument("--dataset_type",    default="legacy",
+                   choices=["legacy", "itaco_sim", "itaco_real", "mixed"],
+                   help="legacy = ArticulatedDataset on data_root (default). "
+                        "itaco_sim = iTACOSimDataset on data_root. "
+                        "itaco_real = iTACORealDataset on data_root. "
+                        "mixed = ConcatDataset(itaco_sim, itaco_real) with weighted sampler.")
+    p.add_argument("--real_mix_ratio",  type=float, default=0.3,
+                   help="For dataset_type=mixed: probability of sampling a real batch.")
+    p.add_argument("--n_unfreeze_blocks", type=int, default=4,
+                   help="phase=2 only: number of last frame+global blocks to unfreeze. "
+                        "Default 4 keeps legacy behavior; set to 10 for the diagnosed "
+                        "domain-shift fine-tune (see doc/change.md Phase D).")
     p.add_argument("--output_dir",      required=True)
     p.add_argument("--img_size",        type=int,   default=518)
     p.add_argument("--num_frames",      type=int,   default=8)

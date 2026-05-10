@@ -258,3 +258,179 @@ vis_feat = vis_feat.to(dino_tokens.dtype)
 - 输出 `/data2/cyt/checkpoints/art_v20_phase_c/`
 
 resume 路径在新一轮训练改为 `art_v20_phase_c/ckpt_024000.pth`(在 Phase C 自身的 checkpoint 上继续训)。
+
+
+## 2026-05-01 Phase D 诊断 — sim→real 域差距定位
+
+ckpt_100000 评估结果(`scripts/eval_phase_c.py` + `--dataset_type real`):
+
+| metric | sim (189 scenes) | real (4 scenes) |
+|---|---|---|
+| fg_iou_mean (identity-free) | **0.771** | **0.175** |
+| assign_iou_mean (slot-aligned) | 0.766 | 0.145 |
+| mIoU_alpha (GS pipeline)      | 0.601 | 0.002 |
+| type_acc / axis_cos           | 0.965 / 0.927 | NaN(无 GT) |
+
+`fg_iou` 是为绕开 SAM2 过分割对 Hungarian 的影响新加的"前景并集 IoU",仍然只有 0.18 →
+排除"指标不公平"假设,**域差距是根本性的**。
+
+### 诊断脚本 `scripts/diag_features_pca.py`
+
+对 sim/real 各 4 个场景跑 aggregator,提取 frame-0 patch tokens,做 PCA→RGB:
+
+- **DINOv2(frozen)**:`norm_mean=32.0, std=0.0` 在 sim 和 real 上完全一致(L2-normalized 输出)。
+- **Aggregator 输出**:sim `std≈21`,real `std≈6` —— **patch 间方差掉到 sim 的 30%**,即 token 趋同 / 特征坍塌。
+
+### Per-layer 坍塌追踪
+
+记录 24 层 aggregator 每一层输出的 `norm-std`:
+
+```
+            层 0-13       层 14-23           峰值
+sim  std    1-2           2 → 23 (单调爆涨)  23.0
+real std    1-3           3 → 7  (轻涨)      6.6 (在 13 层达峰,之后回落)
+```
+
+- 前半层(0-13)在 sim/real 上数值近似,跨域稳定。
+- 后半层(14-23)在 sim 上方差从 2.4 涨到 23(10×),在 real 上只从 3 涨到 7(2×),
+  甚至在 real_002 上 13 层后**反向衰减** —— 后半层主动把 real 特征压平。
+
+结论:**aggregator 后 ~10 层过拟合了 sim 的合成纹理统计量**;DINOv2 + 前半 aggregator 是跨域可用的。
+
+### 后续策略草案
+
+新增 `scripts/launch_ft_real.sh`(DRAFT,**未运行**):
+
+- 只解冻后 10 个 frame_blocks + global_blocks + 全部 heads,frozen 前 14 层 + DINOv2。
+- real 数据无 GT kin/depth,损失只用:fg-mask BCE / motion-mask CE / motion-track。
+- `--w_render = 0`(关闭 GS 渲染,避免 alpha=0.002 的退化项目继续搬运梯度)。
+- LR `5e-6`,total_steps `5000`,bf16 + grad_ckpt + batch=1。
+
+需要的训练脚手架改动(launch script 头部已列):
+1. `train_art.py --dataset_type {sim,real}` + 路由到 `iTACORealDataset`。
+2. `train_art.py --n_unfreeze_blocks N`,传入 `set_phase(phase="2", n_unfreeze_blocks=N)`。
+3. `art_vggt.py::set_phase()` 在 phase="2" 接受 `n_unfreeze_blocks` 参数(默认 4,向后兼容)。
+4. `compute_loss` 在 `dataset_type=="real"` 时跳过 kin/render/bbox/pose_enc。
+5. (可选)`ArticulatedDataset` 加 ColorJitter/Blur 增强,sim→real 同时拉近。
+
+未自动执行 —— 等用户确认 scope 后再落地。
+
+
+### 回归对比:Phase C 训练让 real 域 aggregator 坍塌加重
+
+对 ckpt_024000(Phase C 起点)和 ckpt_100000(终点)分别跑 `diag_features_pca.py`:
+
+| | sim agg std | real agg std |
+|---|---|---|
+| ckpt 24k | 22–27 | **~13** |
+| ckpt 100k | 20–23 | **~6** |
+
+sim 域特征分布几乎不变,但 real 域 patch token 方差在 76k 步训练中**腰斩**。
+含义:Phase C 引入的 sim-only 监督(Fourier track 输入 + motion_track + motion_mask + render losses)
+持续把 aggregator 拉向 sim 分布,real 上的可分性被牺牲。
+
+→ 进一步支持"只解冻后 ~10 层 + heads 在 real 上 fine-tune"的策略,
+  并提示**未来重训 Phase C 时应加 sim-side 域增强或并行 real 弱监督**,
+  避免 backbone 越训 real 越差。
+
+
+## 2026-05-01 iTACO sim_data 接入 — 新 `iTACOSimDataset`
+
+**目的**:Path B —— 抛弃 `data_root_refine`,改用 iTACO sim_data + iTACO real_data 共享同一条 SAM2/MonST3R 弱监督流水线,消除"sim 用 GT mask、real 用 SAM2 mask"造成的输入分布差异。
+
+**数据规模**:786 个场景,11 类,512 hinge + 274 slider 关节(每个 (Cat, instance, joint, view) 算一个独立场景)。
+
+### 关键探测结论(`scripts/inspect_itaco_sim.py` + `scripts/probe_itaco_sim.py`)
+
+1. **GT kin 在全局 JSON**:`/data2/cyt/video2articulation/new_partnet_mobility_dataset_correct_intr_meta.json`,
+   每个 `(Cat, instance)` 有 `interaction_list`:`{id, type:hinge|slider, joint:{axis:{origin, direction}, limit}}`。
+   axis/pivot 在**对象局部坐标系**,`limit` 单位:hinge=度,slider=米。
+2. **场景层 `meta.json`** 给出 `joint_id`,与 interaction_list 中某项匹配。
+3. **camera_pose.npy** 是 `(T, 7) = xyz + quat(wxyz)`,c2w direct(USB 测试 bg_centroid_drift=0.106m vs inv 0.81m)。
+4. **depth/*.npz** 是 `uint16 mm`(key=`'a'`),需 `astype(float32) / 1000` 转米。
+5. **segment/*.npz** 是 `uint8` link-id(key=`'a'`),值 1-9,**不是 part-id**。
+6. **MonST3R masks** 18 个稀疏关键帧(整个视频 90-105 帧,等价 stride ≈ T/18)。
+7. **actor_pose.pkl** 字典 `{actor_X: list[T] of [7] xyz+wxyz}`,actor_X 后缀对应 segment 值。
+
+### Plan A 实现(`datasets/itaco_sim_dataset.py`)
+
+- **active-part 检测**:对每个 actor 算 `trans_std + rot_std`,排序;最高 var 的 actor 后缀 → active segment id。其他 movable actor → 辅助 slot 2..k。验证:Box/Laptop/Storage/USB 4 个场景全部正确分离 active flap。
+- **GT axis/pivot 拟合**:**直接从 active actor 的世界位姿时间序列拟合**,绕过 object-local→world 转换坑(避免 URDF 根节点歧义和 OpenGL/SAPIEN spawn pose 不可知问题):
+  - revolute:`R_rel = R_t @ R_0^T`,从 skew(R_rel - R_rel^T)/(2sinθ) 取轴向;`pivot = pinv(I-R_rel) @ (T_t - R_rel @ T_0)`。
+  - prismatic:`axis = (T_far - T_0).normalize()`,`pivot = T_0`。
+- **gt_scalars**:从 `gt_joint_value.npy` 读,经 `_normalize_scalars` rest-shift 到 `[-1, 1]`。
+- **part_masks 构造**:slot 0 = 非 movable 像素(bg + URDF root + 静态附属),slot 1 = active actor 的 segment,slots 2..k = 其他 movable actor。
+- **motion_mask** 复用 MonST3R dynamic_mask 联合,统一了 sim 和 real 的 motion 监督路径。
+- **tracks** 暂时全零(`has_motion_data=False`),后续可单独跑 CoTracker 预计算填上。
+
+### Smoke-test 结果(`scripts/smoke_test_itaco_sim.py`)
+
+可视化 6 个 Box 场景在 `/data2/cyt/eval/smoke_itaco_sim/`,4 列:
+- RGB
+- 红 = active part overlay → 与移动的 flap 像素一致
+- 绿 = 所有 movable parts overlay → 覆盖全部前景
+- 蓝 = MonST3R 动态 mask → 与运动轨迹对齐
+
+Pivot 投影 sanity-check 在 smoke test 里仍是 OpenGL convention 没调对(投到 px=None 或越界),但**数据本身正确**(axis=[1,0,0] 与 Box 顶部铰链方向匹配,pivot=(0, -3.42, 1.0) 落在 box 顶部边缘世界坐标处)。Train 时模型代码用 `depth = -z_cam`(OpenGL),与数据一致。
+
+### 待办(下一步训练前必须落地)
+
+1. **`train_art.py --dataset_type {itaco_sim, itaco_real, mixed}` + ConcatDataset 加权采样**(real 上采样到 30%)。
+2. **`compute_loss` 按 `dataset_tag` 分支**:
+   - itaco_sim:全部 loss(kin + render + motion + mask)
+   - itaco_real:仅 motion + mask + dead_opacity + l1_sparsity(无 GT kin)
+3. **`set_phase("2", n_unfreeze_blocks=10)`** —— 只解冻后 10 个 frame_blocks + global_blocks + heads,其余冻结。
+4. **(可选)** 给 sim 侧加 ColorJitter / GaussianBlur,sim→real 同时拉近。
+5. 先跑一版**纯 itaco_sim**(无 real 混)的 Phase 1b,看 sim 收敛是否正常(验证 dataset 接入无 bug),再加入 real。
+
+
+## 2026-05-01 Phase D 启动 — sim+real 混训
+
+### 训练脚手架改动(`train_art.py`)
+
+**1. `--dataset_type {legacy, itaco_sim, itaco_real, mixed}`**
+- `legacy`:默认,ArticulatedDataset on `data_root`(向后兼容)
+- `itaco_sim`:`iTACOSimDataset` 786 场景,带 GT kin
+- `itaco_real`:`iTACORealDataset` 4 场景,无 GT kin
+- `mixed`:ConcatDataset(itaco_sim + real_repeat),real 内部重复 N 倍后用 DistributedSampler 均匀采样
+
+**2. `--n_unfreeze_blocks 10`**(phase=2)
+- 修复了旧代码的 bug:原来不分 frame_blocks 和 global_blocks 各自冻结前 N-4 层,新逻辑分别冻结前 `(depth - n_unfreeze_blocks)` 层
+- `set_phase("2", n_unfreeze_blocks=N)` 已传播到 3 个调用点
+
+**3. `compute_loss` 无需改动**
+- `has_kin_gt=False` 分支(line 760-780)已处理 real 批次:跳过 kin/render/bbox/pose_enc,仅保留 mask + sparsity + motion_mask + motion_track
+- sim 批次走完整 loss(kin + render + motion + mask)
+
+**4. DDP 修复(WeightedRandomSampler → ConcatDataset repeat)**
+- `WeightedRandomSampler` 不支持 `set_epoch()`,与 DDP 不兼容
+- 改为 real 数据集内部重复 71×,与 sim 形成 953 总样本(`real_frac≈0.30`),用标准 DistributedSampler
+
+### 启动脚本(`scripts/launch_phase_d.sh`)
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| `--dataset_type` | `mixed` | sim+real 混训 |
+| `--phase` | `2` | fine-tune 模式 |
+| `--n_unfreeze_blocks` | `10` | 解冻后 10 对 frame+global blocks(前 14 对冻结) |
+| `--lr` | `5e-6` | 轻步防止灾难遗忘 |
+| `--total_steps` | `130000` | 从 100000 resume,训 30000 步 |
+| `--real_mix_ratio` | `0.3` | real 占 30% |
+| `--w_motion_mask` | `0.5` | 弱监督主信号(sim/real 共享 MonST3R) |
+| `--w_render` | `0.1` | 降低(仅 sim 侧) |
+| `--w_type/axis/pivot/scalar` | `0.3/0.5/0.2/0.1` | 保持 GT 监督(仅 sim 侧) |
+| `--real_data_root` | `/data2/cyt/video2articulation/real_data` | iTACO real |
+| `--data_root` | `/data2/cyt/video2articulation/sim_data` | iTACO sim |
+
+### 当前状态
+
+训练已启动,4×GPU(4,5,6,7),进程稳定,无 NaN,约 gpu_mem 9.6GB/rank。
+
+预计每 500 步一次 val(仅 sim 验证集,117 场景),每 2500 步保存一次 ckpt。
+首个 val checkpoint 在 step 100500 附近,届时可看 sim 侧 assign_iou 是上升还是下降。
+
+### 待观察指标
+
+1. **sim assign_iou / fg_iou**:Phase C 100k=0.77,Phase D 不应显著下降(超过 0.03)
+2. **real fg_iou**(手动 eval):每 5000 步跑一次 `eval_phase_c.py --dataset_type real`
+3. **gamma 值**:TrackEncoder LayerScale gamma,应保持在 0.1-0.3 范围

@@ -1,0 +1,115 @@
+{
+  "checkpoint": "/data2/cyt/checkpoints/art_v20_phase_c/ckpt_100000.pth",
+  "step": 100000,
+  "n_scenes": 10,
+  "summary": {
+    "mean_iou": 0.902053100990468,
+    "type_acc": 0.9857142857142858,
+    "axis_cos": 0.8160336585981505,
+    "axis_angle_deg": 20.999919614961595,
+    "scalar_mae": 0.4368250024638005,
+    "pivot_l2": 0.08754338690685848
+  },
+  "per_scene": [
+    {
+      "scene_id": "45850/cam_03",
+      "n_matched": 1,
+      "mean_iou": 0.9612569503307656,
+      "type_acc": 1.0,
+      "axis_cos": 0.9969261288642883,
+      "axis_angle_deg": 4.493572659935899,
+      "scalar_mae": 0.40175750851631165,
+      "pivot_l2": 0.07613483816385269
+    },
+    {
+      "scene_id": "11661/cam_01",
+      "n_matched": 1,
+      "mean_iou": 0.912950237492207,
+      "type_acc": 1.0,
+      "axis_cos": 0.12674257159233093,
+      "axis_angle_deg": 82.71860175569726,
+      "scalar_mae": 0.48308897018432617,
+      "pivot_l2": 0.039559584110975266
+    },
+    {
+      "scene_id": "45173/cam_02",
+      "n_matched": 1,
+      "mean_iou": 0.9029106392643808,
+      "type_acc": 1.0,
+      "axis_cos": 0.9977129697799683,
+      "axis_angle_deg": 3.8757556336788292,
+      "scalar_mae": 0.4831637442111969,
+      "pivot_l2": 0.11481549590826035
+    },
+    {
+      "scene_id": "45177/cam_02",
+      "n_matched": 1,
+      "mean_iou": 0.9568984612052679,
+      "type_acc": 1.0,
+      "axis_cos": 0.9993118047714233,
+      "axis_angle_deg": 2.125780253820447,
+      "scalar_mae": 0.41115057468414307,
+      "pivot_l2": 0.0960661768913269
+    },
+    {
+      "scene_id": "45372/cam_02",
+      "n_matched": 1,
+      "mean_iou": 0.8842264047144494,
+      "type_acc": 1.0,
+      "axis_cos": 0.9948601126670837,
+      "axis_angle_deg": 5.811665691950303,
+      "scalar_mae": 0.45257940888404846,
+      "pivot_l2": 0.0802626833319664
+    },
+    {
+      "scene_id": "46014/cam_02",
+      "n_matched": 4,
+      "mean_iou": 0.9145029810084699,
+      "type_acc": 1.0,
+      "axis_cos": 0.9848871827125549,
+      "axis_angle_deg": 9.23551165452947,
+      "scalar_mae": 0.24003303423523903,
+      "pivot_l2": NaN
+    },
+    {
+      "scene_id": "101930/cam_01",
+      "n_matched": 7,
+      "mean_iou": 0.6665750541002416,
+      "type_acc": 0.8571428571428571,
+      "axis_cos": 0.9750619104930333,
+      "axis_angle_deg": 10.826942231997743,
+      "scalar_mae": 0.5841975893293109,
+      "pivot_l2": 0.1298473956329482
+    },
+    {
+      "scene_id": "46801/cam_02",
+      "n_matched": 2,
+      "mean_iou": 0.9225571416241831,
+      "type_acc": 1.0,
+      "axis_cos": 0.9982891976833344,
+      "axis_angle_deg": 3.2954055235335,
+      "scalar_mae": 0.40435272455215454,
+      "pivot_l2": 0.08577578887343407
+    },
+    {
+      "scene_id": "47388/cam_03",
+      "n_matched": 1,
+      "mean_iou": 0.968034218306699,
+      "type_acc": 1.0,
+      "axis_cos": 0.08763839304447174,
+      "axis_angle_deg": 84.97223995245172,
+      "scalar_mae": 0.4939212501049042,
+      "pivot_l2": 0.10457700490951538
+    },
+    {
+      "scene_id": "10655/cam_03",
+      "n_matched": 2,
+      "mean_iou": 0.9306189218580171,
+      "type_acc": 1.0,
+      "axis_cos": 0.9989063143730164,
+      "axis_angle_deg": 2.6437207920208077,
+      "scalar_mae": 0.41400521993637085,
+      "pivot_l2": 0.06085151433944702
+    }
+  ]
+}

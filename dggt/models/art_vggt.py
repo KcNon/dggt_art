@@ -333,12 +333,16 @@ class ArtVGGT(nn.Module):
     # ------------------------------------------------------------------
     # Convenience: freeze / unfreeze parameter groups
     # ------------------------------------------------------------------
-    def set_phase(self, phase: str, warmup: bool = False):
+    def set_phase(self, phase: str, warmup: bool = False,
+                  n_unfreeze_blocks: int = 4):
         """
         Configure parameter freezing for each training phase.
 
         phase: "1a", "1b", or "2"
         warmup: if True (Phase 1a early stage), freeze kinematic + gaussian heads
+        n_unfreeze_blocks: phase=2 only — unfreeze the last N frame+global block
+            pairs. Default 4 (legacy). 10 was diagnosed for sim→real domain
+            fine-tune (see doc/change.md "Phase D 诊断").
         """
         # DINOv2 always frozen (inside aggregator.patch_embed)
         for p in self.aggregator.patch_embed.parameters():
@@ -361,17 +365,18 @@ class ArtVGGT(nn.Module):
                             p.requires_grad_(False)
 
         elif phase == "2":
-            all_layers = (
-                list(self.aggregator.frame_blocks) +
-                list(self.aggregator.global_blocks)
-            )
-            n_freeze = max(0, len(all_layers) - 4)
-            for layer in all_layers[:n_freeze]:
-                for p in layer.parameters():
-                    p.requires_grad_(False)
-            for layer in all_layers[n_freeze:]:
-                for p in layer.parameters():
-                    p.requires_grad_(True)
+            # Freeze first (D-N) of each block list, train last N pairs.
+            depth = len(self.aggregator.frame_blocks)
+            n_keep = min(max(n_unfreeze_blocks, 0), depth)
+            n_freeze = depth - n_keep
+            for blocks in (self.aggregator.frame_blocks,
+                           self.aggregator.global_blocks):
+                for layer in blocks[:n_freeze]:
+                    for p in layer.parameters():
+                        p.requires_grad_(False)
+                for layer in blocks[n_freeze:]:
+                    for p in layer.parameters():
+                        p.requires_grad_(True)
             for mod in [self.camera_head, self.part_slot_router,
                         self.articulation_head, self.gaussian_head,
                         self.track_encoder]:
