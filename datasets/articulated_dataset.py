@@ -205,18 +205,34 @@ class ArticulatedDataset(Dataset):
             except Exception:
                 return -1
 
+        def _is_valid_scene(d: Path) -> bool:
+            return (
+                d.is_dir()
+                and (d / "joint_params.json").exists()
+                and (_has_images(d) or len(_cam_subdirs(d)) > 0)
+                and 0 < _n_joints(d) <= max_parts - 1
+            )
+
         # ── Collect all valid scene-root directories ───────────────────────
         # A scene root is valid if it has joint_params.json AND either:
         #   • a direct images/ dir (format A), or
         #   • at least one cam_XX/ subdir with images (format B)
         # Scenes with more joints than max_parts-1 are silently skipped.
+        #
+        # Two directory layouts are supported transparently:
+        #   • flat:      data_root/{object_id}/...
+        #   • categorised: data_root/{category}/{object_id}/...   (PartNet-Mobility
+        #     data_processed groups scenes under category folders)
         valid_roots = sorted([
-            d for d in self.data_root.iterdir()
-            if d.is_dir()
-            and (d / "joint_params.json").exists()
-            and (_has_images(d) or len(_cam_subdirs(d)) > 0)
-            and 0 < _n_joints(d) <= max_parts - 1
+            d for d in self.data_root.iterdir() if _is_valid_scene(d)
         ])
+        if len(valid_roots) == 0:
+            # Descend one level: treat immediate children as category dirs.
+            for cat in sorted(self.data_root.iterdir()):
+                if cat.is_dir():
+                    valid_roots.extend(
+                        sorted(s for s in cat.iterdir() if _is_valid_scene(s))
+                    )
         assert len(valid_roots) > 0, f"No valid scenes in {data_root}"
 
         # ── Train/val split at scene-root level (prevents data leakage) ────
@@ -358,13 +374,57 @@ class ArticulatedDataset(Dataset):
             gt_scalars[p, :] = torch.tensor(norm_angles, dtype=torch.float32)
 
         # ── Part masks [S, max_parts, H, W] ──────────────────────────────
-        # Mask ID mapping:
-        #   joint k (0-indexed) → mask part_id = k + 2
-        #   the last mask (part_id = n_joints + 2) = static root/base → Slot 0
+        # Two naming conventions are supported:
+        #
+        #  (1) part_index.json present (PartNet-Mobility data_processed):
+        #      mask files are {fid}_{seg_id}.png where seg_id is SAPIEN's
+        #      absolute per_scene_id. part_index.json (scene-level, built by
+        #      scripts/build_partnet_part_index.py) maps joint_name → seg_id.
+        #      Dynamic slot p=k+1 ← joint_keys[k]'s seg_id; every other mask
+        #      id on disk (base / extra static links / stray light ids) → Slot 0.
+        #
+        #  (2) no part_index.json (legacy convention):
+        #      joint k → mask part_id = k+2;  static root → n_joints+2 → Slot 0.
         masks_dir  = data_dir / "part_masks"
         part_masks = torch.zeros(S, self.max_parts, H, W)
 
-        if masks_dir.exists():
+        part_index = None
+        pidx_path = scene_root / "part_index.json"
+        if pidx_path.exists():
+            try:
+                part_index = json.load(open(pidx_path))
+            except Exception:
+                part_index = None
+
+        if part_index is not None and masks_dir.exists():
+            # seg_id → dynamic slot index (1..n_joints) via joint_keys ordering
+            joint_id = part_index.get("joint_id", {})
+            id_to_slot = {}
+            for k, jkey in enumerate(joint_keys):
+                sid = joint_id.get(jkey)
+                if sid is not None:
+                    id_to_slot[int(sid)] = k + 1
+
+            for s, fid in enumerate(frame_ids):
+                slot_union = torch.zeros(H, W)
+                for mpath in masks_dir.glob(f"{fid}_*.png"):
+                    try:
+                        seg_id = int(mpath.stem.split("_")[1])
+                    except Exception:
+                        continue
+                    p = id_to_slot.get(seg_id)
+                    if p is None:
+                        continue   # base / extra static links / stray ids → Slot 0
+                    mk = _load_mask(str(mpath), W, H)
+                    part_masks[s, p] = mk
+                    slot_union = (slot_union + mk).clamp(0, 1)
+
+                # Slot 0 = everything not claimed by a dynamic slot
+                # (true background ∪ static base/links ∪ stray ids), with no
+                # double-counting against dynamic slots → exact partition.
+                part_masks[s, 0] = (1.0 - slot_union).clamp(0, 1)
+
+        elif masks_dir.exists():
             for s, fid in enumerate(frame_ids):
                 slot_union = torch.zeros(H, W)
 

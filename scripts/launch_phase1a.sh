@@ -4,19 +4,20 @@
 # Usage: bash scripts/launch_phase1a.sh
 # ============================================================
 
-PHASE1A_DIR="/data2/cyt/checkpoints/art_v20_phase1a"
-TRAIN_SCRIPT="/home/yuantao/code/dggt_art/train_art.py"
+# NOTE: /data2 (2.9G free) and / (6.4G free) are nearly full — pick a disk with
+# room before a long run; each checkpoint (model+optimizer) can exceed 1GB.
+PHASE1A_DIR="/data5/lza/checkpoint/Art/phase1a"
+TRAIN_SCRIPT="/home/ziang/code/dggt_art/train_art.py"
 
 mkdir -p "${PHASE1A_DIR}"
 
 echo "[$(date)] Launching Phase 1a → ${PHASE1A_DIR}/train.log"
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun \
-    --nproc_per_node=7 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+    --nproc_per_node=4 \
     --master_port=29502 \
     "${TRAIN_SCRIPT}" \
-    --data_root             /data2/cyt/data_root_refine \
-    --resume                 /data2/cyt/checkpoints/art_v20_phase1a/ckpt_003500.pth \
+    --data_root             /data2/lza/partnet-Mobility/data_processed \
     --output_dir            "${PHASE1A_DIR}" \
     --phase                 1a \
     --num_frames            8 \
@@ -25,7 +26,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun \
     --lr                    1e-4 \
     --weight_decay          1e-4 \
     --grad_clip             1.0 \
-    --total_steps           50000 \
+    --total_steps           20000 \
     --w_type                0.5 \
     --w_axis                0.0 \
     --w_pivot               0.0 \
@@ -42,8 +43,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 torchrun \
     --warmup_iou_threshold  0.8 \
     --gradient_checkpointing \
     --use_bf16 \
-    --num_workers           7 \
-    --exclude_cam \
+    --num_workers           4 \
+    --exclude_cams \
     --reset_scheduler \
     >> "${PHASE1A_DIR}/train.log" 2>&1
 
