@@ -40,7 +40,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --log_interval          50 \
     --save_interval         2000 \
     --val_interval          500 \
-    --warmup_iou_threshold  0.8 \
+    --warmup_iou_threshold  0.6 \
     --gradient_checkpointing \
     --use_bf16 \
     --num_workers           4 \

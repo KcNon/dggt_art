@@ -225,7 +225,15 @@ class PartSlotRouter(nn.Module):
 
         self.slot_norm = nn.LayerNorm(dim_slot)
 
+        # ── Background sink slot ──────────────────────────────────────────
+        # A learnable token appended to the P part slots ONLY for the
+        # attention/assignment. It absorbs background patches so the P part
+        # slots (slot 0 = base part, paper-aligned) are not forced to claim
+        # background. Excluded from slot_features (no part head decodes it).
+        self.bg_token = nn.Parameter(torch.zeros(1, 1, dim_slot))
+
         self._init_weights()
+        nn.init.normal_(self.bg_token, std=0.02)
 
     # ------------------------------------------------------------------ #
 
@@ -253,7 +261,8 @@ class PartSlotRouter(nn.Module):
         """
         Returns:
             slot_features : [B, P, dim_slot]
-            assign_maps   : [B, P, H_p, W_p]  (softmax over P)
+            assign_maps   : [B, P, H_p, W_p]  (P part slots; softmax over P+1 incl. bg, so sums to <1)
+            bg_map        : [B, 1, H_p, W_p]  (background sink channel)
         """
         B, S, P_total, _ = agg_tokens.shape
         N_patches = P_total - self.patch_start_idx
@@ -298,7 +307,11 @@ class PartSlotRouter(nn.Module):
             "slot_init must be provided from Aggregator. "
             "Ensure Aggregator is constructed with num_slots > 0."
         )
-        slots = slot_init                                           # [B, P, dim_slot]
+        # Append the background sink slot → [B, P+1, dim_slot]. It participates
+        # in all attention layers but is sliced off before returning slot_features.
+        slots = torch.cat(
+            [slot_init, self.bg_token.expand(B, -1, -1)], dim=1
+        )                                                           # [B, P+1, dim_slot]
         last_attn_weights: torch.Tensor | None = None
 
         for i, (layer, ltype) in enumerate(zip(self.layers, self.layer_types)):
@@ -322,7 +335,7 @@ class PartSlotRouter(nn.Module):
             else:  # self
                 image_tokens, slots = layer(image_tokens, slots)
 
-        slot_features = self.slot_norm(slots)                       # [B, P, dim_slot]
+        slot_features = self.slot_norm(slots)[:, :self.num_slots]   # [B, P, dim_slot] (drop bg)
 
         # ── 5. Assignment maps from last cross-attn weights ───────────────
         # Use frame 0 (canonical rest state) only.
@@ -331,18 +344,23 @@ class PartSlotRouter(nn.Module):
         # Mean-over-frames was incorrect: for a moving part, averaging attention
         # across S frames gives diffuse maps that don't match the single-frame GT,
         # capping warmup IoU at ~0.62 regardless of LR.
+        Pp1 = self.num_slots + 1   # P part slots + 1 background sink
         if last_attn_weights is not None:
-            # [B, S*N, P] → reshape to [B, S, N, P] → take frame 0 → [B, N, P]
-            assign = last_attn_weights.reshape(B, S, N_patches, self.num_slots)
-            assign = assign[:, 0, :, :]                             # [B, N, P]
-            assign_maps = assign.permute(0, 2, 1)                   # [B, P, N]
-            assign_maps = assign_maps.reshape(B, self.num_slots, H_p, W_p)
+            # [B, S*N, P+1] → reshape to [B, S, N, P+1] → take frame 0 → [B, N, P+1]
+            assign = last_attn_weights.reshape(B, S, N_patches, Pp1)
+            assign = assign[:, 0, :, :]                             # [B, N, P+1]
+            assign = assign.permute(0, 2, 1).reshape(B, Pp1, H_p, W_p)
         else:
             # Fallback: dot-product (should not be reached in normal operation)
             temp = 1.0 / math.sqrt(self.dim_slot)
-            logits = torch.bmm(image_tokens, slot_features.transpose(1, 2)) * temp
-            assign = F.softmax(logits, dim=-1)                      # [B, S*N, P]
-            assign = assign.reshape(B, S, N_patches, self.num_slots)[:, 0, :, :]
-            assign_maps = assign.permute(0, 2, 1).reshape(B, self.num_slots, H_p, W_p)
+            all_slots = self.slot_norm(slots)                      # [B, P+1, dim_slot]
+            logits = torch.bmm(image_tokens, all_slots.transpose(1, 2)) * temp
+            assign = F.softmax(logits, dim=-1)                      # [B, S*N, P+1]
+            assign = assign.reshape(B, S, N_patches, Pp1)[:, 0, :, :]
+            assign = assign.permute(0, 2, 1).reshape(B, Pp1, H_p, W_p)
 
-        return slot_features, assign_maps
+        # Split: P part-slot maps (sum to <1; bg mass removed) + bg sink map.
+        assign_maps = assign[:, :self.num_slots]                   # [B, P, H_p, W_p]
+        bg_map      = assign[:, self.num_slots:]                   # [B, 1, H_p, W_p]
+
+        return slot_features, assign_maps, bg_map

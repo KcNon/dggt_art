@@ -119,20 +119,31 @@ def _adjust_intrinsics(K: np.ndarray,
     return K
 
 
-def _normalize_scalars(values: list[float]) -> list[float]:
+def _normalize_scalars(values: list[float], motion_type: str,
+                       scene_radius: float = 1.0) -> list[float]:
     """
-    Normalize joint angle / distance values to [-1, 1], centered on rest state.
+    Map physical joint values → normalised motion scalar S ∈ [-1, 1], centred on
+    rest, using the SAME convention as the SDF renderer / paper (Eq.S4-S5):
 
-    values[0] is the rest-state value (frame 0 = canonical rest pose).
-    After normalization, rest state → 0, and the largest deviation maps to ±1.
-    This gives scalar=0 a clear physical meaning: the joint is at rest.
+        revolute : S = (angle_rad   − rest) / (2π)      ← render: angle = 2π·S
+        prismatic: S = (translation − rest) / (2·r)     ← render: trans = 2r·S
+        static   : 0
+
+    This keeps the kinematic-supervision target and the differentiable ray
+    transform geometrically consistent (an absolute physical scale), unlike the
+    old per-joint max-deviation normalisation which conflicted with the renderer.
+
+    values[0] is the rest-state value (frame 0 = canonical rest pose) → S=0.
     """
+    import math
     rest = values[0]
-    shifted = [v - rest for v in values]
-    max_abs = max(abs(v) for v in shifted)
-    if max_abs < 1e-8:
+    if motion_type == "revolute":
+        denom = 2.0 * math.pi
+    elif motion_type == "prismatic":
+        denom = 2.0 * scene_radius
+    else:
         return [0.0] * len(values)
-    return [v / max_abs for v in shifted]
+    return [(v - rest) / denom for v in values]
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +381,7 @@ class ArticulatedDataset(Dataset):
                 else:
                     # Flat format: single scalar per frame; assign to joint_0 only
                     raw_angles.append(float(frame_val) if k == 0 else 0.0)
-            norm_angles = _normalize_scalars(raw_angles)
+            norm_angles = _normalize_scalars(raw_angles, jdata["type"])
             gt_scalars[p, :] = torch.tensor(norm_angles, dtype=torch.float32)
 
         # ── Part masks [S, max_parts, H, W] ──────────────────────────────
@@ -387,6 +398,11 @@ class ArticulatedDataset(Dataset):
         #      joint k → mask part_id = k+2;  static root → n_joints+2 → Slot 0.
         masks_dir  = data_dir / "part_masks"
         part_masks = torch.zeros(S, self.max_parts, H, W)
+        # Pure static-body silhouette (root/base links only, NO background) — used
+        # by the SDF render loss so the big solid static part is rendered+supervised.
+        # slot0 of part_masks stays bg∪static for the router/segmentation target.
+        static_body_mask = torch.zeros(S, H, W)
+        has_static_mask  = False
 
         part_index = None
         pidx_path = scene_root / "part_index.json"
@@ -419,10 +435,20 @@ class ArticulatedDataset(Dataset):
                     part_masks[s, p] = mk
                     slot_union = (slot_union + mk).clamp(0, 1)
 
-                # Slot 0 = everything not claimed by a dynamic slot
-                # (true background ∪ static base/links ∪ stray ids), with no
-                # double-counting against dynamic slots → exact partition.
-                part_masks[s, 0] = (1.0 - slot_union).clamp(0, 1)
+                # Pure static-body silhouette = union of static_ids masks (no bg).
+                for sid in part_index.get("static_ids", []):
+                    mp = masks_dir / f"{fid}_{int(sid)}.png"
+                    if mp.exists():
+                        sm = _load_mask(str(mp), W, H)
+                        static_body_mask[s] = (static_body_mask[s] + sm).clamp(0, 1)
+                if static_body_mask[s].sum() > 0:
+                    has_static_mask = True
+
+                # Slot 0 = base part (pure static body, NO background) — paper-aligned.
+                # Background belongs to no slot; the router's bg-sink absorbs it.
+                # (If static_ids yields no pixels, slot 0 is empty and all background
+                #  flows to the sink — never reintroduce bg into slot 0.)
+                part_masks[s, 0] = static_body_mask[s].clone()
 
         elif masks_dir.exists():
             for s, fid in enumerate(frame_ids):
@@ -442,9 +468,14 @@ class ArticulatedDataset(Dataset):
                 mpath_root = masks_dir / f"{fid}_{root_id}.png"
                 root_mask  = _load_mask(str(mpath_root), W, H)
 
-                # Slot 0 = background ∪ static root
-                background = (1.0 - slot_union).clamp(0, 1)
-                part_masks[s, 0] = (background + root_mask).clamp(0, 1)
+                # Pure static-body silhouette = static root mask (no bg).
+                static_body_mask[s] = root_mask.clamp(0, 1)
+                if static_body_mask[s].sum() > 0:
+                    has_static_mask = True
+
+                # Slot 0 = base part (pure static root, NO background) — paper-aligned.
+                # Background belongs to no slot; the router's bg-sink absorbs it.
+                part_masks[s, 0] = root_mask.clamp(0, 1)
 
         # ── Pseudo-masks for Phase 2 (SAM2 output) ───────────────────────
         # Expected layout: {data_dir}/pseudo_masks/{fid}_{slot_id}.png
@@ -574,6 +605,8 @@ class ArticulatedDataset(Dataset):
             "intrinsics":       intrinsics,        # [3, 3]
             "timestamps":       timestamps,        # [S]
             "part_masks":       part_masks,        # [S, P, H, W]
+            "static_body_mask": static_body_mask,  # [S, H, W]  pure static body (no bg)
+            "has_static_mask":  has_static_mask,   # bool
             "pseudo_masks":     pseudo_masks,      # [S, P, H, W]  (zeros if phase!="2")
             "has_pseudo_masks": has_pseudo,        # bool
             "depth":            depth,             # [S, H, W]      (zeros if missing)

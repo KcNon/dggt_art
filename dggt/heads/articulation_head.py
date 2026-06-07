@@ -72,20 +72,26 @@ class ArticulationHead(nn.Module):
             nn.GELU(),
         )
 
-        # Static output heads (operate on backbone output)
-        self.bbox_head  = nn.Linear(hidden_dim, 6)          # center(3) + size(3)
-        self.type_head  = nn.Linear(hidden_dim, 2)          # prismatic / revolute
-        self.axis_head  = nn.Linear(hidden_dim, 3)
-        self.pivot_head = nn.Linear(hidden_dim, 3)
+        # Single articulation vector head (paper Fig.2 / Eq.3-6):
+        #   Â_p ∈ R^14 = [bbox_center(3) | bbox_size(3) | axis(3) | pivot(3) | type(2)]
+        # partitioned along the channel axis and remapped in forward().
+        # (The +T scalar part is produced by the timestamp-conditioned sub-MLP below.)
+        self.art_head = nn.Linear(hidden_dim, 14)
 
-        # Dynamics: scalar per (slot, frame) via timestamp conditioning
-        # Input: slot backbone feature (hidden_dim) + timestamp scalar (1)
+        # Channel partition of the 14-dim articulation vector
+        self._SL_BBOX_C = slice(0, 3)
+        self._SL_BBOX_S = slice(3, 6)
+        self._SL_AXIS   = slice(6, 9)
+        self._SL_PIVOT  = slice(9, 12)
+        self._SL_TYPE   = slice(12, 14)
+
+        # Dynamics: scalar per (slot, frame) via timestamp conditioning.
+        # Final 2*sigmoid-1 maps to [-1,1] (paper Eq.6: S_p = 2*ψ(Ŝ_p) - 1).
         self.scalar_mlp = nn.Sequential(
             nn.LayerNorm(hidden_dim + 1),
             nn.Linear(hidden_dim + 1, scalar_hidden),
             nn.GELU(),
             nn.Linear(scalar_hidden, 1),
-            nn.Tanh(),
         )
 
         self._init_weights()
@@ -108,11 +114,14 @@ class ArticulationHead(nn.Module):
         """
         Returns:
             motion_type_logits : [B, P, 2]   raw logits [prismatic, revolute]
-            axis               : [B, P, 3]   L2-normalised unit vectors
-            pivot              : [B, P, 3]   ∈ [-r, r]³
-            scalars            : [B, P, S]   ∈ [-1, 1]
-            bbox_center        : [B, P, 3]   ∈ [-r, r]³
-            bbox_size          : [B, P, 3]   ∈ (0, r]³  (half-extent)
+                                 (Slot 0 is the static base; its logits are forced
+                                  to static (prismatic ← -inf) so argmax/softmax keep
+                                  it immobile — paper: 2-way class only on movable slots)
+            axis               : [B, P, 3]   L2-normalised unit vectors      (Eq.4)
+            pivot              : [B, P, 3]   ∈ [-r, r]³                       (Eq.5)
+            scalars            : [B, P, S]   ∈ [-1, 1]  per-frame            (Eq.6)
+            bbox_center        : [B, P, 3]   ∈ [-r, r]³                       (Eq.3)
+            bbox_size          : [B, P, 3]   ∈ (0, 2r]³  (half-extent)        (Eq.3)
         """
         B, P, D = slot_features.shape
         S = timestamps.shape[1]
@@ -124,32 +133,30 @@ class ArticulationHead(nn.Module):
         h = self.backbone(feat_flat)                     # [B*P, hidden_dim]
         h_bp = h.reshape(B, P, -1)                      # [B, P, hidden_dim]
 
-        # ── Static outputs ────────────────────────────────────────────────
-        # BBox
-        raw_bbox = self.bbox_head(h)                     # [B*P, 6]
-        raw_bbox = raw_bbox.reshape(B, P, 6)
-        bbox_center = 2.0 * r * torch.sigmoid(raw_bbox[..., :3]) - r   # ∈ [-r, r]³
-        bbox_size   = r * torch.sigmoid(raw_bbox[..., 3:])               # ∈ (0, r]  (half-extent)
+        # ── Single articulation vector Â_p ∈ R^14, partition + remap ───────
+        a = self.art_head(h).reshape(B, P, 14)           # [B, P, 14]
 
-        # Motion type logits (2-class)
-        motion_type_logits = self.type_head(h).reshape(B, P, 2)          # [B, P, 2]
+        bbox_center = 2.0 * r * torch.sigmoid(a[..., self._SL_BBOX_C]) - r   # ∈ [-r, r]³  (Eq.3)
+        bbox_size   = 2.0 * r * torch.sigmoid(a[..., self._SL_BBOX_S])       # ∈ (0, 2r]³  (Eq.3)
+        axis        = F.normalize(a[..., self._SL_AXIS], dim=-1, eps=1e-4)   # unit       (Eq.4)
+        pivot       = 2.0 * r * torch.sigmoid(a[..., self._SL_PIVOT]) - r    # ∈ [-r, r]³  (Eq.5)
+        motion_type_logits = a[..., self._SL_TYPE].contiguous()             # [B, P, 2]
 
-        # Axis (L2 normalised)
-        axis_raw = self.axis_head(h).reshape(B, P, 3)
-        axis = F.normalize(axis_raw, dim=-1, eps=1e-4)                   # [B, P, 3]  eps=1e-4 safe for float16
+        # Slot 0 = static base (paper convention): 2-way movable classification
+        # applies only to Slots 1..P-1. Slot 0's logits are detached to a neutral
+        # constant; static-ness is enforced where motion is applied (loss sets
+        # motion_probs[:,0]=[1,0,0]; SDF renderer never transforms Slot 0).
+        motion_type_logits = motion_type_logits.clone()
+        motion_type_logits[:, 0, :] = 0.0
 
-        # Pivot
-        pivot_raw = self.pivot_head(h).reshape(B, P, 3)
-        pivot = 2.0 * r * torch.sigmoid(pivot_raw) - r                  # [B, P, 3]
-
-        # ── Dynamic scalars (timestamp-conditioned) ───────────────────────
-        # h_bp: [B, P, hidden_dim]
-        # timestamps: [B, S]  → [B, 1, S, 1] → [B, P, S, 1]
+        # ── Dynamic scalars (timestamp-conditioned, Eq.6: S_p = 2ψ-1) ──────
+        # h_bp: [B, P, hidden_dim]; timestamps: [B, S] → [B, P, S, 1]
         h_exp = h_bp.unsqueeze(2).expand(-1, -1, S, -1)                 # [B, P, S, hidden]
         ts_exp = timestamps.unsqueeze(1).unsqueeze(-1).expand(B, P, S, 1)
         inp_sc = torch.cat([h_exp, ts_exp], dim=-1)                     # [B, P, S, hidden+1]
         inp_sc_flat = inp_sc.reshape(B * P * S, -1)
-        scalars = self.scalar_mlp(inp_sc_flat).reshape(B, P, S)         # [B, P, S]
+        scalars = 2.0 * torch.sigmoid(self.scalar_mlp(inp_sc_flat)) - 1.0
+        scalars = scalars.reshape(B, P, S)                              # [B, P, S]
 
         return {
             "motion_type_logits": motion_type_logits,   # [B, P, 2]

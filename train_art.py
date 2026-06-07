@@ -51,6 +51,7 @@ from dggt.utils.dead_slot_gating import (
 from dggt.utils.hungarian_matching import match_and_fix, reorder_by_match
 from scipy.optimize import linear_sum_assignment
 from dggt.utils.rigid_transform import apply_rigid_transform
+from dggt.render.sdf_volume import generate_rays, render_rays_static
 from datasets.articulated_dataset import ArticulatedDataset
 
 
@@ -70,9 +71,10 @@ def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> to
 
 
 def mask_loss(
-    assign_maps: torch.Tensor,   # [B, P, H_p, W_p]
-    gt_masks: torch.Tensor,      # [B, P_gt, H, W]
+    assign_maps: torch.Tensor,   # [B, P, H_p, W_p]   P part slots (slot 0 = base part)
+    gt_masks: torch.Tensor,      # [B, P_gt, H, W]    gt part 0 = base part (no bg)
     matches: list,
+    bg_map: torch.Tensor = None, # [B, 1, H_p, W_p]   background sink (paper-aligned)
     fg_weight: float = 10.0,
     dice_weight: float = 2.0,
 ) -> torch.Tensor:
@@ -82,25 +84,42 @@ def mask_loss(
     NLL pushes P(correct_slot | pixel) up per-pixel but allows diffuse predictions.
     Dice directly optimizes soft-mask overlap ≈ IoU, bridging the gap between NLL
     and the argmax-IoU eval metric.  Combined loss breaks the ~0.67 IoU plateau.
+
+    Background handling: when `bg_map` is given (paper-aligned slot0 = base part),
+    a background CLASS (index P) is appended so background pixels — which belong to
+    NO part slot — are classified into the sink instead of being forced into slot 0.
+    Without bg_map, the legacy behaviour (label 0 = catch-all) is used.
     """
     B, P, H_p, W_p = assign_maps.shape
     H, W = gt_masks.shape[-2:]
 
+    if bg_map is not None:
+        # P part channels + background sink → [B, P+1, H, W]; bg label = P.
+        maps = torch.cat([assign_maps, bg_map], dim=1)
+        bg_label = P
+    else:
+        maps = assign_maps
+        bg_label = None
+
     pred_up = F.interpolate(
-        assign_maps, (H, W), mode="bilinear", align_corners=False
-    )   # [B, P, H, W]
+        maps, (H, W), mode="bilinear", align_corners=False
+    )   # [B, P(+1), H, W]
     log_pred = torch.log(pred_up.clamp(min=1e-8))
 
     total = pred_up.new_zeros(1)
 
     for b, (pred_idx, gt_idx) in enumerate(matches):
-        # Build per-pixel label map: 0 = background slot
-        label_map = torch.zeros(H, W, dtype=torch.long, device=pred_up.device)
+        # Build per-pixel label map. Default = background:
+        #   - paper-aligned: bg class P (pixels belonging to no part)
+        #   - legacy:        slot 0 (catch-all)
+        default = bg_label if bg_label is not None else 0
+        label_map = torch.full((H, W), default, dtype=torch.long, device=pred_up.device)
         for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
             label_map[gt_masks[b, gi] > 0.5] = pi
 
-        # Per-pixel weight: upweight foreground pixels
-        pixel_weight = torch.where(label_map > 0,
+        # Per-pixel weight: upweight part (foreground) pixels over background.
+        is_fg = (label_map != default) if bg_label is not None else (label_map > 0)
+        pixel_weight = torch.where(is_fg,
                                    label_map.new_full((), fg_weight).float(),
                                    label_map.new_ones(()).float())   # [H, W]
 
@@ -112,7 +131,7 @@ def mask_loss(
         ).squeeze(0)
         total = total + (nll * pixel_weight).sum() / pixel_weight.sum()
 
-        # Dice loss per matched (slot, part) pair
+        # Dice loss per matched (slot, part) pair (part channels only)
         for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
             pred_mask = pred_up[b, pi]            # [H, W] soft
             gt_mask   = gt_masks[b, gi]           # [H, W] binary
@@ -654,12 +673,154 @@ def motion_aux_loss(
 # Training loop
 # ============================================================================
 
+def sdf_render_loss(
+    head,                              # HexaPlaneSDFHead (.query)
+    planes: torch.Tensor,             # [B, P, 6, Cf, R, R]
+    bbox_center: torch.Tensor,        # [B, P, 3]
+    bbox_size: torch.Tensor,          # [B, P, 3]
+    is_dead: torch.Tensor,            # [B, P] bool (pred-slot order)
+    matches: list,                    # per-batch (pred_idx, gt_idx)
+    extrinsics: torch.Tensor,         # [B, S, 4, 4] cam-to-world
+    intrinsics: torch.Tensor,         # [B, 3, 3]
+    gt_images: torch.Tensor,          # [B, S, 3, H, W] in [0,1]
+    gt_masks_seq: torch.Tensor,       # [B, S, P_gt, H, W]  (slot 0 = base part, no bg)
+    motion_type_logits: torch.Tensor, # [B, P, 2]
+    axis: torch.Tensor,               # [B, P, 3]
+    pivot: torch.Tensor,              # [B, P, 3]
+    scalars: torch.Tensor,            # [B, P, S]
+    gt_depth: torch.Tensor = None,    # [B, S, H, W]  camera z-depth (0 = background)
+    scene_radius: float = 1.0,
+    beta: float = 0.1,
+    n_rays: int = 1024,
+    n_samples: int = 48,
+    max_frames: int = 4,
+    w_rgb: float = 1.0,
+    w_sil: float = 1.0,
+    w_part: float = 1.0,
+    w_depth: float = 1.0,
+) -> torch.Tensor:
+    """
+    SDF volume rendering loss over multiple articulated frames.
+
+    The STATIC base part (pred slot 0 ↔ GT part 0, paper-aligned pure static body)
+    is rendered alongside the movable parts, so the largest/most-solid part — the
+    strongest geometric signal — is supervised. For each selected frame s, movable
+    parts are moved to their stage-s pose by inverse-transforming the rays
+    (ray_transform; the base part is static, no transform), then rendered + supervised:
+      • per-part opacity (silhouette)  vs per-part GT mask_s  (BCE), incl. base
+      • union opacity                  vs union of ALL rendered masks_s (BCE)
+      • composited RGB                 vs GT image_s, on object foreground (L1)
+      • expected ray distance          vs GT depth_s, on object foreground (L1)
+    Background belongs to no part (router bg-sink); it is simply absent from the
+    union. Gradients flow to planes/bbox AND axis/pivot/scalar/motion-type.
+    """
+    B, P = planes.shape[:2]
+    S = scalars.shape[-1]
+    H, W = gt_images.shape[-2:]
+    device = planes.device
+    total = planes.new_zeros(())
+    n_terms = 0
+
+    # Frames to render: spread across the sequence (always include rest frame 0).
+    n_f = min(max_frames, S)
+    frame_ids = torch.linspace(0, S - 1, n_f).round().long().tolist()
+
+    with torch.amp.autocast("cuda", enabled=False):
+        planes_f = planes.float()
+        center_f = bbox_center.float()
+        size_f   = bbox_size.float()
+        axis_f   = axis.float()
+        pivot_f  = pivot.float()
+        scal_f   = scalars.float()
+        # motion probs [B,P,3] = [static, prismatic, revolute]; static=0 for movable
+        mp2 = torch.softmax(motion_type_logits.float(), dim=-1)         # [B,P,2]
+        motion_probs = torch.cat([mp2.new_zeros(B, P, 1), mp2], dim=-1)  # [B,P,3]
+        # Force pred slot 0 (the base part) fully static so its rays are NOT
+        # inverse-transformed (slot-0 type logits are zeroed → mp2≈uniform otherwise).
+        motion_probs[:, 0] = motion_probs.new_tensor([1.0, 0.0, 0.0])
+
+        for b in range(B):
+            # pred-slot → GT part map (shared across frames).
+            # Base part: pred slot 0 ↔ GT part 0 (fixed by design, not in `matches`).
+            alive = torch.zeros(P, dtype=torch.bool, device=device)
+            pred2gt = {}
+            if not bool(is_dead[b, 0]) and (gt_masks_seq[b, :, 0] > 0.5).any():
+                alive[0] = True
+                pred2gt[0] = 0
+            for pi, gi in zip(matches[b][0].tolist(), matches[b][1].tolist()):
+                if gi >= 1 and not bool(is_dead[b, pi]):
+                    alive[pi] = True
+                    pred2gt[pi] = gi
+            if not bool(alive.any()):
+                continue
+            rendered_gt = [pred2gt[pi] for pi in range(P) if alive[pi]]
+
+            for s in frame_ids:
+                masks = (gt_masks_seq[b, s] > 0.5).float()       # [P_gt, H, W]
+                union = masks[rendered_gt].sum(0).clamp(0, 1)    # [H, W] full object fg
+
+                # Sample pixels: half foreground, half random
+                fg_idx = torch.nonzero(union.reshape(-1) > 0.5, as_tuple=False).squeeze(-1)
+                n_fg = min(n_rays // 2, fg_idx.numel())
+                sel = []
+                if n_fg > 0:
+                    sel.append(fg_idx[torch.randint(fg_idx.numel(), (n_fg,), device=device)])
+                sel.append(torch.randint(H * W, (n_rays - n_fg,), device=device))
+                pix_flat = torch.cat(sel)
+                pix_xy = torch.stack([(pix_flat % W).float(), (pix_flat // W).float()], dim=-1)
+
+                ro, rd = generate_rays(extrinsics[b, s].float(), intrinsics[b].float(), pix_xy)
+                out = render_rays_static(
+                    head, planes_f[b], center_f[b], size_f[b], alive, ro, rd,
+                    beta=beta, n_samples=n_samples,
+                    motion_probs=motion_probs[b], axis=axis_f[b], pivot=pivot_f[b],
+                    scalar=scal_f[b, :, s], scene_radius=scene_radius,
+                )
+
+                gt_rgb = gt_images[b, s].float().reshape(3, -1)[:, pix_flat].transpose(0, 1)
+                gt_un  = union.reshape(-1)[pix_flat]
+                fg_mask = gt_un > 0.5
+
+                opacity = out["opacity"][:, 0].clamp(1e-5, 1 - 1e-5)
+                l_sil = F.binary_cross_entropy(opacity, gt_un)
+                l_part = planes.new_zeros(())
+                for pi in range(P):
+                    if not bool(alive[pi]):
+                        continue
+                    gt_p = masks[pred2gt[pi]].reshape(-1)[pix_flat]
+                    po = out["part_opacity"][:, pi].clamp(1e-5, 1 - 1e-5)
+                    l_part = l_part + F.binary_cross_entropy(po, gt_p)
+                l_part = l_part / max(len(rendered_gt), 1)
+
+                l_rgb = (out["rgb"][fg_mask] - gt_rgb[fg_mask]).abs().mean() \
+                    if fg_mask.any() else planes.new_zeros(())
+
+                # Depth: expected ray distance vs GT camera-z depth → ray distance.
+                l_depth = planes.new_zeros(())
+                if gt_depth is not None and w_depth > 0:
+                    K = intrinsics[b].float()
+                    u = pix_xy[:, 0]; v = pix_xy[:, 1]
+                    raylen = torch.sqrt(((u - K[0, 2]) / K[0, 0]) ** 2
+                                        + ((v - K[1, 2]) / K[1, 1]) ** 2 + 1.0)
+                    t_gt = gt_depth[b, s].float().reshape(-1)[pix_flat] * raylen
+                    dm = fg_mask & (t_gt > 0)
+                    if dm.any():
+                        l_depth = (out["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
+
+                total = total + (w_sil * l_sil + w_part * l_part
+                                 + w_rgb * l_rgb + w_depth * l_depth)
+                n_terms += 1
+
+    return total / max(n_terms, 1)
+
+
 def compute_loss(
     preds: dict,
     batch: dict,
     step: int,
     cfg: argparse.Namespace,
     is_warmup: bool,
+    head=None,
 ) -> tuple[torch.Tensor, dict]:
     """
     Unified loss computation (all phases).
@@ -714,7 +875,9 @@ def compute_loss(
         render_extrinsics = None
 
     # ── Mask loss (always active) ─────────────────────────────────────────
-    l_mask = mask_loss(assign_maps, gt_masks, matches)
+    # Pass bg_map so background pixels classify into the sink, keeping slot 0 a
+    # pure base part (paper-aligned). gt_masks[:,0] must be the base-part mask.
+    l_mask = mask_loss(assign_maps, gt_masks, matches, bg_map=preds.get("bg_map"))
     loss_dict["mask"] = l_mask
 
     # ── Slot sparsity (always active, weight ramps up after warmup) ───────
@@ -775,104 +938,48 @@ def compute_loss(
     )
     loss_dict.update(kin_losses)
 
-    # ── Dead-slot opacity penalty ─────────────────────────────────────────
-    opacity_flat = preds["gs_opacity"].squeeze(-1)   # [B, P, N_g]
-    l_dead_op = dead_slot_opacity_loss(opacity_flat, is_dead, cfg.w_dead_opacity)
+    # ── Dead-slot opacity penalty (GS-specific; N/A for SDF) ─────────────
+    l_dead_op = assign_maps.new_zeros(()).squeeze()
     loss_dict["dead_opacity"] = l_dead_op
 
-    # ── Build sign-corrected axis/scalar in prediction-slot order ────────
-    # global_render_loss (gsplat) composites a single RGB frame, so slot
-    # order is irrelevant and it uses pred-slot inputs.
-    P_pred = preds["axis"].shape[1]
-    flip_mask = preds["axis"].new_zeros(B, P_pred, 1)   # [B, P, 1], no grad
-    for b, (pred_idx, gt_idx) in enumerate(matches):
-        if len(pred_idx) > 0:
-            dot_bm = (preds["axis"][b, pred_idx] * gt_axis[b, gt_idx]).sum(dim=-1)
-            flip_mask[b, pred_idx, 0] = (dot_bm < 0).float()
-    axis_for_render   = preds["axis"]    * (1.0 - 2.0 * flip_mask)   # [B, P, 3]
-    scalar_for_render = preds["scalars"] * (1.0 - 2.0 * flip_mask)   # [B, P, S]
-
-    # ── Reorder pred tensors to GT-slot order for slot-index-direct losses ─
-    # per_part_alpha_render_loss and bbox_loss supervise pred slot p against
-    # GT channel p. Without reordering this conflicts with Hungarian (which
-    # permutes assign_maps freely), causing all non-background slots to drift
-    # dead — confirmed at ckpt_074000 where only slot 0 had opacity > 0.
-    # Reorder pred tensors into GT order; unmatched GT channels (padding for
-    # scenes with fewer joints than max_parts) are zero-filled and marked
-    # dead so the loss skips them. Slot 0 is pass-through (background, not
-    # in matches by design).
+    # ── Reorder bbox to GT-slot order for the slot-index-direct bbox loss ─
     def _to_gt_order(t: torch.Tensor) -> torch.Tensor:
         out = reorder_by_match(t, matches, P_gt)
         out[:, 0] = t[:, 0]
         return out
 
-    gs_mu_gt       = _to_gt_order(preds["gs_mu"])              # [B, P_gt, N_g, 3]
-    gs_opacity_gt  = _to_gt_order(preds["gs_opacity"])         # [B, P_gt, N_g, 1]
-    pivot_gt       = _to_gt_order(preds["pivot"])              # [B, P_gt, 3]
-    mtl_gt         = _to_gt_order(preds["motion_type_logits"]) # [B, P_gt, 2]
     bbox_center_gt = _to_gt_order(preds["bbox_center"])        # [B, P_gt, 3]
     bbox_size_gt   = _to_gt_order(preds["bbox_size"])          # [B, P_gt, 3]
-    # axis_fixed / scalar_fixed are already in GT order from match_and_fix;
-    # patch slot 0 with pred slot 0 (slot 0 is static so axis/scalar are
-    # unused, but keep a valid non-zero axis to avoid any 0/0 normalise path).
-    axis_gt         = axis_fixed.clone()
-    axis_gt[:, 0]   = preds["axis"][:, 0]
-    scalar_gt       = scalar_fixed.clone()
-    scalar_gt[:, 0] = preds["scalars"][:, 0]
 
-    # is_dead in GT order: unmatched GT slots → dead so loss skips them.
-    is_dead_gt = reorder_by_match(
-        is_dead.float().unsqueeze(-1), matches, P_gt
-    ).squeeze(-1).bool()
-    is_matched_gt = is_dead.new_zeros(B, P_gt, dtype=torch.bool)
-    for b, (_, gt_idx_b) in enumerate(matches):
-        if len(gt_idx_b) > 0:
-            is_matched_gt[b, gt_idx_b] = True
-    is_matched_gt[:, 0] = True
-    is_dead_gt = is_dead_gt | (~is_matched_gt)
-    is_dead_gt[:, 0] = is_dead[:, 0]
-
-    # ── Per-part alpha rendering loss (local, differentiable, no gsplat) ─
-    if cfg.w_render > 0.0 and render_extrinsics is not None:
-        gt_masks_seq = batch["part_masks"].to(device)   # [B, S, P_gt, H, W]
-        l_render = cfg.w_render * per_part_alpha_render_loss(
-            gs_mu              = gs_mu_gt,
-            gs_opacity         = gs_opacity_gt,
-            motion_type_logits = mtl_gt,
-            axis               = axis_gt,
-            pivot              = pivot_gt,
-            scalars            = scalar_gt,
-            extrinsics         = render_extrinsics,
-            intrinsics         = batch["intrinsics"].to(device),
-            gt_masks_seq       = gt_masks_seq,
-            is_dead            = is_dead_gt,
-            patch_size         = 14,
+    # ── SDF volume rendering loss (replaces GS per-part + gsplat render) ──
+    if cfg.w_render > 0.0 and render_extrinsics is not None and head is not None:
+        l_render = cfg.w_render * sdf_render_loss(
+            head         = head,
+            planes       = preds["planes"],
+            bbox_center  = preds["bbox_center"],
+            bbox_size    = preds["bbox_size"],
+            is_dead      = is_dead,
+            matches      = matches,
+            extrinsics   = render_extrinsics,
+            intrinsics   = batch["intrinsics"].to(device),
+            gt_images    = batch["images"].to(device),
+            gt_masks_seq = batch["part_masks"].to(device),
+            motion_type_logits = preds["motion_type_logits"],
+            axis         = preds["axis"],
+            pivot        = preds["pivot"],
+            scalars      = preds["scalars"],
+            gt_depth     = batch["depth"].to(device) if "depth" in batch else None,
+            scene_radius = cfg.scene_radius,
+            beta         = getattr(cfg, "sdf_beta", 0.1),
+            n_rays       = getattr(cfg, "sdf_rays", 1024),
+            max_frames   = getattr(cfg, "sdf_frames", 4),
+            w_depth      = getattr(cfg, "w_depth", 1.0),
         )
     else:
-        l_render = preds["gs_mu"].new_zeros(1).squeeze()
+        l_render = assign_maps.new_zeros(()).squeeze()
     loss_dict["render"] = l_render
 
-    # ── Global composited RGB rendering loss (gsplat rasterization) ──────
-    w_render_global = getattr(cfg, "w_render_global", 0.0)
-    if w_render_global > 0.0 and render_extrinsics is not None:
-        l_render_global = w_render_global * global_render_loss(
-            gs_mu              = preds["gs_mu"],
-            gs_rot             = preds["gs_rot"],
-            gs_scale           = preds["gs_scale"],
-            gs_color           = preds["gs_color"],
-            gs_opacity         = preds["gs_opacity"],
-            motion_type_logits = preds["motion_type_logits"],
-            axis               = axis_for_render,
-            pivot              = preds["pivot"],
-            scalars            = scalar_for_render,
-            extrinsics         = render_extrinsics,
-            intrinsics         = batch["intrinsics"].to(device),
-            gt_images          = batch["images"].to(device),
-            is_dead            = is_dead,
-            max_frames         = 2,
-        )
-    else:
-        l_render_global = preds["gs_mu"].new_zeros(1).squeeze()
+    l_render_global = assign_maps.new_zeros(()).squeeze()
     loss_dict["render_global"] = l_render_global
 
     # ── BBox centroid projection loss (slot-index-direct, GT-ordered) ────
@@ -984,7 +1091,16 @@ def eval_mean_iou(model, val_loader, device, cfg) -> float:
 
                 if not is_phase1b:
                     # ── Phase 1a: assign_maps vs frame-0 GT ─────────────────
-                    pred_argmax = pred_up_f0.argmax(dim=1)        # [B, H, W]
+                    # Include the background sink in the argmax (if present) so
+                    # background pixels resolve to bg (class P), not a part slot.
+                    bg_map = preds.get("bg_map")
+                    if bg_map is not None:
+                        bg_up = F.interpolate(bg_map, (H, W), mode="bilinear",
+                                              align_corners=False)
+                        argmax_src = torch.cat([pred_up_f0, bg_up], dim=1)  # [B, P+1, H, W]
+                    else:
+                        argmax_src = pred_up_f0
+                    pred_argmax = argmax_src.argmax(dim=1)        # [B, H, W]
                     arange_p = torch.arange(P, device=device).view(1, P, 1, 1)
                     pred_bin = (arange_p == pred_argmax.unsqueeze(1)).float()  # [B, P, H, W]
 
@@ -1117,7 +1233,7 @@ def main(cfg: argparse.Namespace):
         num_slots=8,
         n_gaussians=cfg.n_gaussians,
         scene_radius=cfg.scene_radius,
-        use_camera_head=True,
+        use_camera_head=False,   # always use GT camera params (no pose prediction)
         stop_gradient_plucker=(cfg.phase == "2"),
         gradient_checkpointing=getattr(cfg, "gradient_checkpointing", False),
     ).to(device)
@@ -1289,7 +1405,8 @@ def main(cfg: argparse.Namespace):
         with autocast("cuda", dtype=torch.bfloat16, enabled=getattr(cfg, "use_bf16", False)):
             preds = model(images, extrinsics, intrinsics, timestamps)
             loss, loss_dict = compute_loss(
-                preds, batch, step, cfg, is_warmup=(not warmup_done)
+                preds, batch, step, cfg, is_warmup=(not warmup_done),
+                head=raw_model.sdf_head,
             )
 
         # Synchronise NaN/Inf check across all DDP ranks so all ranks skip together.

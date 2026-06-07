@@ -38,7 +38,7 @@ from dggt.models.aggregator import Aggregator
 from dggt.heads.camera_head import CameraHead
 from dggt.heads.part_slot_router import PartSlotRouter
 from dggt.heads.articulation_head import ArticulationHead
-from dggt.heads.art_gaussian_head import ArtGaussianHead
+from dggt.heads.hexaplane_sdf_head import HexaPlaneSDFHead
 from dggt.utils.plucker import compute_plucker_rays_patch, plucker_stop_gradient
 
 
@@ -110,10 +110,13 @@ class ArtVGGT(nn.Module):
             scene_radius=scene_radius,
         )
 
-        self.gaussian_head = ArtGaussianHead(
+        # Geometry/texture branch: per-part hexa-plane SDF field (replaces GS).
+        self.sdf_head = HexaPlaneSDFHead(
             dim_in=embed_dim,
             num_slots=num_slots,
-            n_gaussians=n_gaussians,
+            plane_res=64,
+            plane_ch=32,
+            sphere_radius=0.5,
             scene_radius=scene_radius,
             dim_patch=3 * embed_dim,   # agg_last(2C) + dino_last(C) = 3C
             dim_proj=256,
@@ -225,7 +228,7 @@ class ArtVGGT(nn.Module):
         preds["plucker_rays"] = plucker_rays
 
         # ── 4. PartSlotRouter (decoder) ────────────────────────────────────
-        slot_features, assign_maps = self.part_slot_router(
+        slot_features, assign_maps, bg_map = self.part_slot_router(
             image_tokens,
             dino_tokens,
             plucker_rays,
@@ -234,7 +237,8 @@ class ArtVGGT(nn.Module):
             slot_init=slot_states,   # slot tokens pre-enriched by Aggregator global blocks
         )
         preds["slot_features"] = slot_features   # [B, P, D]
-        preds["assign_maps"]   = assign_maps      # [B, P, H_p, W_p]
+        preds["assign_maps"]   = assign_maps      # [B, P, H_p, W_p] (P part slots, sums<1)
+        preds["bg_map"]        = bg_map           # [B, 1, H_p, W_p] background sink
 
         # ── 5. Articulation head ────────────────────────────────────────────
         art = self.articulation_head(slot_features, timestamps)
@@ -256,18 +260,13 @@ class ArtVGGT(nn.Module):
         dino_frame0 = dino_tokens[:,  0, patch_start_idx:, :]   # [B, N_p,  C]
         patch_feats_frame0 = torch.cat([agg_frame0, dino_frame0], dim=-1)  # [B, N_p, 3C]
 
-        gs = self.gaussian_head(
+        # Hexa-plane SDF field per part (queried during SDF volume rendering).
+        planes = self.sdf_head.decode_planes(
             slot_features,
-            bbox_center=art["bbox_center"],
-            bbox_size=art["bbox_size"],
             patch_feats_frame0=patch_feats_frame0,
             assign_maps=assign_maps,
         )
-        preds["gs_mu"]      = gs["mu"]       # [B, P, N_g, 3]
-        preds["gs_rot"]     = gs["rot"]      # [B, P, N_g, 4]
-        preds["gs_scale"]   = gs["scale"]    # [B, P, N_g, 3]
-        preds["gs_color"]   = gs["color"]    # [B, P, N_g, 3]
-        preds["gs_opacity"] = gs["opacity"]  # [B, P, N_g, 1]
+        preds["planes"] = planes   # [B, P, 6, Cf, R, R]
 
         return preds
 
@@ -289,13 +288,13 @@ class ArtVGGT(nn.Module):
             for p in self.aggregator.parameters():
                 p.requires_grad_(True)
             for mod in [self.camera_head, self.part_slot_router,
-                        self.articulation_head, self.gaussian_head]:
+                        self.articulation_head, self.sdf_head]:
                 if mod is not None:
                     for p in mod.parameters():
                         p.requires_grad_(True)
             # During warmup: freeze articulation and gaussian heads
             if warmup:
-                for mod in [self.articulation_head, self.gaussian_head]:
+                for mod in [self.articulation_head, self.sdf_head]:
                     if mod is not None:
                         for p in mod.parameters():
                             p.requires_grad_(False)
@@ -313,7 +312,7 @@ class ArtVGGT(nn.Module):
                 for p in layer.parameters():
                     p.requires_grad_(True)
             for mod in [self.camera_head, self.part_slot_router,
-                        self.articulation_head, self.gaussian_head]:
+                        self.articulation_head, self.sdf_head]:
                 if mod is not None:
                     for p in mod.parameters():
                         p.requires_grad_(True)
