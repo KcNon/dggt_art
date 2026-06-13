@@ -110,9 +110,57 @@ def render_rays_static(
     """
     P = planes.shape[0]
     Nr = rays_o.shape[0]
-    device = rays_o.device
+    cd = collect_samples(
+        head, planes, bbox_center, bbox_size, alive, rays_o, rays_d,
+        n_samples=n_samples, motion_probs=motion_probs, axis=axis,
+        pivot=pivot, scalar=scalar, scene_radius=scene_radius,
+    )
+    if cd is None:
+        bg = rays_o.new_full((Nr, 3), bg_color)
+        return {
+            "rgb": bg,
+            "opacity": rays_o.new_zeros(Nr, 1),
+            "depth": rays_o.new_zeros(Nr, 1),
+            "part_opacity": rays_o.new_zeros(Nr, P),
+        }
+    # Shared SDF/RGB MLPs (single call). For the multi-frame training loss, prefer
+    # collect_samples → ONE global MLP call across all frames → composite_samples,
+    # so each shared param is used exactly once per backward (DDP-safe). This
+    # wrapper keeps the single-image API (overfit / inference) unchanged.
+    sdf   = head.sdf_mlp(cd["feats"]) + cd["s_bias"]
+    rgb   = torch.sigmoid(head.rgb_mlp(cd["feats"]))
+    sigma = volsdf_density(sdf[:, 0], beta)
+    return composite_samples(
+        sigma, rgb, cd["ray_idx"], cd["t_starts"], cd["t_ends"], cd["part"],
+        Nr, P, bg_color=bg_color,
+    )
 
-    ray_idx_all, ts_all, te_all, sig_all, rgb_all, part_all = [], [], [], [], [], []
+
+def collect_samples(
+    head,                              # HexaPlaneSDFHead (for .query_features)
+    planes: torch.Tensor,             # [P, 6, Cf, R, R]
+    bbox_center: torch.Tensor,        # [P, 3]
+    bbox_size: torch.Tensor,          # [P, 3] half-extent
+    alive: torch.Tensor,              # [P] bool
+    rays_o: torch.Tensor,             # [Nr, 3]
+    rays_d: torch.Tensor,             # [Nr, 3] unit
+    n_samples: int = 64,
+    motion_probs: torch.Tensor = None,
+    axis: torch.Tensor = None,
+    pivot: torch.Tensor = None,
+    scalar: torch.Tensor = None,
+    scene_radius: float = 1.0,
+) -> dict | None:
+    """
+    Sample points along rays per alive part and query their per-part hexa features.
+    Does NOT call the shared SDF/RGB MLPs — the caller batches those into a single
+    call (so the shared params are used exactly once per backward → DDP-safe).
+    Returns dict(feats[N,3Cf], s_bias[N,1], ray_idx[N], t_starts[N], t_ends[N],
+    part[N]) or None if no part is hit by any ray.
+    """
+    P = planes.shape[0]
+    device = rays_o.device
+    ray_idx_all, ts_all, te_all, feat_all, sbias_all, part_all = [], [], [], [], [], []
 
     for p in range(P):
         if not bool(alive[p]):
@@ -145,36 +193,43 @@ def render_rays_static(
         t_mid    = 0.5 * (t_starts + t_ends)
 
         ray_of = ray_sel[:, None].expand(-1, n_samples).reshape(-1)   # [K*n]
-        o_s = o_p[ray_of]
-        d_s = d_p[ray_of]
-        x_rest = o_s + t_mid[:, None] * d_s                    # [K*n, 3] rest frame
+        x_rest = o_p[ray_of] + t_mid[:, None] * d_p[ray_of]    # [K*n, 3] rest frame
         x_hat = (x_rest - center) / size                       # [-1,1]³ inside AABB
 
-        sdf, rgb = head.query(planes[p], x_hat)                # [K*n,1], [K*n,3]
-        sigma = volsdf_density(sdf[:, 0], beta)                # [K*n]
-
+        # Per-part hexa features (uses per-part `planes[p]` activations, NOT shared
+        # params). Shared SDF/RGB MLPs are deferred to a single batched call upstream.
+        feat_all.append(head.query_features(planes[p], x_hat))  # [K*n, 3Cf]
+        sbias_all.append(x_hat.norm(dim=-1, keepdim=True) - head.sphere_radius)
         ray_idx_all.append(ray_of)
         ts_all.append(t_starts)
         te_all.append(t_ends)
-        sig_all.append(sigma)
-        rgb_all.append(rgb)
         part_all.append(torch.full_like(ray_of, p))
 
-    bg = rays_o.new_full((Nr, 3), bg_color)
     if len(ray_idx_all) == 0:
-        return {
-            "rgb": bg,
-            "opacity": rays_o.new_zeros(Nr, 1),
-            "depth": rays_o.new_zeros(Nr, 1),
-            "part_opacity": rays_o.new_zeros(Nr, P),
-        }
+        return None
+    return {
+        "feats":    torch.cat(feat_all),    # [N, 3Cf]
+        "s_bias":   torch.cat(sbias_all),   # [N, 1]
+        "ray_idx":  torch.cat(ray_idx_all), # [N]
+        "t_starts": torch.cat(ts_all),      # [N]
+        "t_ends":   torch.cat(te_all),      # [N]
+        "part":     torch.cat(part_all),    # [N]
+    }
 
-    ray_idx = torch.cat(ray_idx_all)
-    t_starts = torch.cat(ts_all)
-    t_ends   = torch.cat(te_all)
-    sigma    = torch.cat(sig_all)
-    rgb      = torch.cat(rgb_all)
-    part     = torch.cat(part_all)
+
+def composite_samples(
+    sigma: torch.Tensor,    # [N]    per-sample density
+    rgb: torch.Tensor,      # [N, 3] per-sample colour
+    ray_idx: torch.Tensor,  # [N]    ray index in [0, Nr)
+    t_starts: torch.Tensor, # [N]
+    t_ends: torch.Tensor,   # [N]
+    part: torch.Tensor,     # [N]    part id per sample
+    Nr: int,
+    P: int,
+    bg_color: float = 1.0,
+) -> dict:
+    """Sort merged samples per ray and volume-composite → rgb/opacity/depth/part_opacity."""
+    bg = sigma.new_full((Nr, 3), bg_color)
 
     # Sort samples per ray by increasing distance (merge parts along each ray).
     key = ray_idx.double() * 1e6 + t_mid_global(t_starts, t_ends)
@@ -185,15 +240,13 @@ def render_rays_static(
     weights, _, _ = nerfacc.render_weight_from_density(
         t_starts, t_ends, sigma, ray_indices=ray_idx, n_rays=Nr
     )                                                          # [N]
-    w = weights.unsqueeze(-1)
-
     comp_rgb = nerfacc.accumulate_along_rays(weights, rgb, ray_idx, Nr)    # [Nr,3]
     opacity  = nerfacc.accumulate_along_rays(weights, None, ray_idx, Nr)   # [Nr,1]
     t_mid    = 0.5 * (t_starts + t_ends)
     depth    = nerfacc.accumulate_along_rays(weights, t_mid.unsqueeze(-1), ray_idx, Nr)
 
     # Per-part accumulated alpha (silhouette of each part)
-    part_opacity = rays_o.new_zeros(Nr, P)
+    part_opacity = sigma.new_zeros(Nr, P)
     for p in range(P):
         m = (part == p)
         if m.any():

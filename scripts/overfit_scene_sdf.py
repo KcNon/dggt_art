@@ -1,15 +1,15 @@
 """
 Single-scene multi-view per-part SDF overfit (paper-style losses).
 
-Renders ALL parts COMPOSITED (occlusion-aware) and supervises each part's
-occlusion-aware opacity vs its (modal) GT mask + composite RGB — matching
-train_art.sdf_render_loss. (Rendering parts in isolation vs modal GT masks
-wrongly penalises occluded regions and tanks IoU on self-occluding parts.)
+Mask loss uses the COMPOSITE (occlusion-aware) part_opacity vs the (modal) GT
+mask — correct for modal masks, where an isolated full silhouette would over-
+shoot. RGB/depth follow paper §3.4: rendered PER-PART (each part in isolation)
+and supervised only on that part's modal mask, avoiding boundary cross-talk.
 
 Losses per step, over K (view,stage) pairs with balanced ray sampling:
   • per-part mask L2 (fg-weighted): occlusion-aware part_opacity vs GT part mask
-  • composite RGB L2 on foreground   + LPIPS (perceptual, dense, periodic)
-  • eikonal (finite-difference SDF grad → clean distance field)
+  • per-part RGB L2 + per-part depth L1, each on the part's modal mask
+  • LPIPS (perceptual, dense, periodic, composite) + eikonal (SDF grad)
 Coarse-to-fine: 1/β linearly annealed (soft → sharp). Articulation = GT.
 """
 import os, sys, math, argparse, torch
@@ -38,8 +38,17 @@ ap.add_argument("--w_depth", type=float, default=1.0, help="GT depth supervision
 ap.add_argument("--geom_only", action="store_true", help="geometry only: mask L2 + depth L1 + eikonal, NO RGB/LPIPS")
 ap.add_argument("--only_part", type=int, default=-1, help="isolate a single moving part by its index in the moving list (diagnostic)")
 ap.add_argument("--no_base", action="store_true", help="exclude the static base part (slot 0); render movable parts only (legacy diagnostic)")
+ap.add_argument("--no_part_mask", action="store_true", help="ablation: drop per-part mask supervision, use only the object silhouette (union)")
+ap.add_argument("--single_stage", type=int, default=-1, help="Step-1 ablation: fit ONE stage as a static scene (all parts static, no articulation). Use the most-open stage.")
+ap.add_argument("--rgb_mode", choices=["perpart", "composite"], default="composite",
+                help="composite (default, better w/ modal masks+depth): RGB/depth on the composited image "
+                     "over the union foreground. perpart (paper §3.4): each part rendered in isolation, "
+                     "supervised on its modal mask — needs amodal masks to pay off; ~4x slower, worse on the "
+                     "self-occluded base part in A/B on 40453 (0.94->0.84 base IoU).")
+ap.add_argument("--seed", type=int, default=0, help="fix RNG for reproducible A/B comparison")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
+torch.manual_seed(args.seed); np.random.seed(args.seed)
 R = args.res
 
 ds = ArticulatedDataset(data_root="/data2/lza/partnet-Mobility/data_processed",
@@ -102,13 +111,31 @@ def beta_at(step):
     inv = (1/0.3) + f * ((1/0.02) - (1/0.3))
     return 1.0 / inv
 
+# Step-1 ablation: render every part STATIC (no ray transform) at a single pose,
+# so each field directly represents the part at that pose — isolates decomposition.
+mprob_static = torch.zeros_like(mprob_m)        # all-static → no inverse transform
+
 def render_all(planes, v, t, beta, sel):
-    """Composite render of ALL moving parts (occlusion-aware)."""
+    """Composite render of ALL parts (occlusion-aware). Static if --single_stage."""
     ro, rd = generate_rays(extr[v, t], intr[v], pix[sel])
+    mprob = mprob_static if args.single_stage >= 0 else mprob_m
     return render_rays_static(
         head, planes, bb_c, bb_s.clamp(min=0.05), aliveP, ro, rd,
         beta=beta, n_samples=64,
-        motion_probs=mprob_m, axis=axis_m, pivot=pivot_m, scalar=scal_m[:, t],
+        motion_probs=mprob, axis=axis_m, pivot=pivot_m, scalar=scal_m[:, t],
+        scene_radius=1.0)
+
+# Per-part one-hot alive masks for isolated rendering (paper §3.4 per-part losses).
+_one_hot = torch.eye(P, dtype=torch.bool, device=dev)
+
+def render_one(planes, v, t, beta, sel, p):
+    """Render part p in ISOLATION (occlusion-free) for per-part RGB/depth loss."""
+    ro, rd = generate_rays(extr[v, t], intr[v], pix[sel])
+    mprob = mprob_static if args.single_stage >= 0 else mprob_m
+    return render_rays_static(
+        head, planes, bb_c, bb_s.clamp(min=0.05), _one_hot[p], ro, rd,
+        beta=beta, n_samples=64,
+        motion_probs=mprob, axis=axis_m, pivot=pivot_m, scalar=scal_m[:, t],
         scene_radius=1.0)
 
 def sample_rays(v, t, n, fg_frac=0.5):
@@ -142,27 +169,53 @@ for it in range(args.steps):
     planes = head.decode_planes(latent)[0]
     loss = torch.zeros((), device=dev)
     for _ in range(args.kvs):
-        v = torch.randint(V, (1,)).item(); t = torch.randint(S, (1,)).item()
+        v = torch.randint(V, (1,)).item()
+        t = args.single_stage if args.single_stage >= 0 else torch.randint(S, (1,)).item()
         sel = sample_rays(v, t, args.rays)
         out = render_all(planes, v, t, beta, sel)
         pop = out["part_opacity"].clamp(1e-4, 1-1e-4)         # [N,P] occlusion-aware
         gti = imgs[v, t].reshape(3, -1).transpose(0, 1)[sel]
         union = pmask[v, t, parts].sum(0).clamp(0, 1).reshape(-1)[sel]
-        for p in range(P):
-            gtm = pmask[v, t, parts[p]].reshape(-1)[sel]
-            w_px = torch.where(gtm > 0.5, 10.0, 1.0)
-            loss = loss + (w_px * (pop[:, p] - gtm) ** 2).mean()
-        fg = union > 0.5
-        if fg.any() and not args.geom_only:
-            loss = loss + F.mse_loss(out["rgb"][fg], gti[fg])
-        # depth: render expected ray-distance vs GT (camera z-depth → ray dist)
-        if args.w_depth > 0:
-            u = pix[sel][:, 0]; vv = pix[sel][:, 1]; K = intr[v]
-            raylen = torch.sqrt(((u-K[0,2])/K[0,0])**2 + ((vv-K[1,2])/K[1,1])**2 + 1)
-            t_gt = depths[v, t].reshape(-1)[sel] * raylen
-            dm = fg & (t_gt > 0)
-            if dm.any():
-                loss = loss + args.w_depth * (out["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
+        if args.no_part_mask:
+            # Only the OBJECT silhouette (union) supervises geometry; parts must
+            # separate on their own via RGB + their distinct GT articulation.
+            op = out["opacity"][:, 0].clamp(1e-4, 1-1e-4)
+            w_px = torch.where(union > 0.5, 10.0, 1.0)
+            loss = loss + (w_px * (op - union) ** 2).mean()
+        else:
+            for p in range(P):
+                gtm = pmask[v, t, parts[p]].reshape(-1)[sel]
+                w_px = torch.where(gtm > 0.5, 10.0, 1.0)
+                loss = loss + (w_px * (pop[:, p] - gtm) ** 2).mean()
+        u = pix[sel][:, 0]; vv = pix[sel][:, 1]; K = intr[v]
+        raylen = torch.sqrt(((u-K[0,2])/K[0,0])**2 + ((vv-K[1,2])/K[1,1])**2 + 1)
+        t_gt = depths[v, t].reshape(-1)[sel] * raylen
+        if args.rgb_mode == "composite":
+            # OLD: RGB/depth on the composited image over the union foreground.
+            fg = union > 0.5
+            if fg.any() and not args.geom_only:
+                loss = loss + F.mse_loss(out["rgb"][fg], gti[fg])
+            if args.w_depth > 0:
+                dm = fg & (t_gt > 0)
+                if dm.any():
+                    loss = loss + args.w_depth * (out["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
+        else:
+            # PER-PART (paper §3.4): each part rendered in ISOLATION and supervised
+            # only on its MODAL GT mask — avoids boundary cross-talk. Occluded
+            # interiors (absent from modal masks) are left unsupervised.
+            for p in range(P):
+                gtm_p = pmask[v, t, parts[p]].reshape(-1)[sel] > 0.5
+                if not gtm_p.any():
+                    continue
+                need_rgb = (not args.geom_only)
+                dm = gtm_p & (t_gt > 0) if args.w_depth > 0 else None
+                if not need_rgb and (dm is None or not dm.any()):
+                    continue
+                outp = render_one(planes, v, t, beta, sel, p)
+                if need_rgb:
+                    loss = loss + F.mse_loss(outp["rgb"][gtm_p], gti[gtm_p])
+                if dm is not None and dm.any():
+                    loss = loss + args.w_depth * (outp["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
     loss = loss / args.kvs
     loss = loss + args.w_eik * eikonal(planes)
     if perc is not None and not args.geom_only and it % 4 == 0:
@@ -179,8 +232,10 @@ for it in range(args.steps):
         with torch.no_grad():
             leik = eikonal(planes)
             ious, psnrs = [], []
+            per_part = {p: [] for p in range(P)}
+            eval_stages = [args.single_stage] if args.single_stage >= 0 else [0, S//2, S-1]
             for v2 in range(V):
-                for t2 in [0, S//2, S-1]:                    # avg over stages
+                for t2 in eval_stages:                       # avg over stages
                     out = render_all(planes, v2, t2, beta, allidx)
                     pop = out["part_opacity"]
                     for p in range(P):
@@ -189,20 +244,45 @@ for it in range(args.steps):
                             continue
                         inter = ((pop[:, p] > 0.5) & (gtm > 0.5)).sum().float()
                         uni = ((pop[:, p] > 0.5) | (gtm > 0.5)).sum().float()
-                        ious.append((inter/(uni+1e-6)).item())
+                        iou_p = (inter/(uni+1e-6)).item()
+                        ious.append(iou_p); per_part[p].append(iou_p)
                     union = pmask[v2, t2, parts].sum(0).clamp(0, 1).reshape(-1)
                     fg = union > 0.5
                     if fg.any():
                         gti = imgs[v2, t2].reshape(3, -1).transpose(0, 1)
                         mse = F.mse_loss(out["rgb"][fg], gti[fg])
                         psnrs.append((-10*torch.log10(mse+1e-8)).item())
-        print(f"{it:4d} | {loss.item():.4f} | {np.mean(ious):.3f} | {np.mean(psnrs):5.2f} | {leik.item():.3f} | {beta:.3f}")
+        pp = " ".join(f"p{parts[p]}={np.mean(per_part[p]):.2f}" for p in range(P) if per_part[p])
+        print(f"{it:4d} | {loss.item():.4f} | {np.mean(ious):.3f} | {np.mean(psnrs):5.2f} | {leik.item():.3f} | {beta:.3f} | {pp}")
+
+# Per-stage × per-part IoU breakdown (disambiguates closed-stage scoring artifact)
+with torch.no_grad():
+    planes = head.decode_planes(latent)[0]
+    print("per-stage per-part IoU (rows=stage, cols=parts; '-' = GT<10px):")
+    hdr = "stage | " + " ".join(f"p{parts[p]:>2}" for p in range(P))
+    print(hdr)
+    for t in range(S):
+        cells = []
+        for p in range(P):
+            ip = []
+            for v2 in range(V):
+                out = render_all(planes, v2, t, beta_at(args.steps-1), allidx)
+                gtm = pmask[v2, t, parts[p]].reshape(-1)
+                if gtm.sum() < 10:
+                    continue
+                po = out["part_opacity"][:, p]
+                inter = ((po > 0.5) & (gtm > 0.5)).sum().float()
+                uni = ((po > 0.5) | (gtm > 0.5)).sum().float()
+                ip.append((inter/(uni+1e-6)).item())
+            cells.append(f"{np.mean(ip):.2f}" if ip else "  - ")
+        print(f"{t:5d} | " + " ".join(f"{c:>4}" for c in cells))
 
 # Dump reconstruction (view 0, stages 0/mid/last)
 with torch.no_grad():
     planes = head.decode_planes(latent)[0]
     rows = []
-    for t in [0, S//2, S-1]:
+    dump_stages = [args.single_stage] if args.single_stage >= 0 else [0, S//2, S-1]
+    for t in dump_stages:
         out = render_all(planes, 0, t, beta_at(args.steps-1), allidx)
         if args.geom_only:
             # [render opacity | GT union mask | render depth | GT depth]  (grayscale)

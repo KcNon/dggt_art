@@ -31,6 +31,7 @@ import math
 import os
 import random
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -51,7 +52,10 @@ from dggt.utils.dead_slot_gating import (
 from dggt.utils.hungarian_matching import match_and_fix, reorder_by_match
 from scipy.optimize import linear_sum_assignment
 from dggt.utils.rigid_transform import apply_rigid_transform
-from dggt.render.sdf_volume import generate_rays, render_rays_static
+from dggt.render.sdf_volume import (
+    generate_rays, render_rays_static, collect_samples, composite_samples,
+    volsdf_density,
+)
 from datasets.articulated_dataset import ArticulatedDataset
 
 
@@ -109,12 +113,21 @@ def mask_loss(
     total = pred_up.new_zeros(1)
 
     for b, (pred_idx, gt_idx) in enumerate(matches):
+        # Hungarian matches cover only movable slots 1..P-1 ↔ gt 1..P-1; the base
+        # pair (slot 0 ↔ gt 0) is fixed by design and NOT returned by the matcher.
+        # With the bg-sink (slot0 = base part), we MUST add it here, else the base
+        # part's pixels fall through to the bg default and we train the sink to
+        # swallow the base (slot 0 then dies — the phase-1a IoU-plateau bug).
+        pairs = list(zip(pred_idx.tolist(), gt_idx.tolist()))
+        if bg_label is not None:
+            pairs = [(0, 0)] + pairs
+
         # Build per-pixel label map. Default = background:
         #   - paper-aligned: bg class P (pixels belonging to no part)
         #   - legacy:        slot 0 (catch-all)
         default = bg_label if bg_label is not None else 0
         label_map = torch.full((H, W), default, dtype=torch.long, device=pred_up.device)
-        for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+        for pi, gi in pairs:
             label_map[gt_masks[b, gi] > 0.5] = pi
 
         # Per-pixel weight: upweight part (foreground) pixels over background.
@@ -131,8 +144,8 @@ def mask_loss(
         ).squeeze(0)
         total = total + (nll * pixel_weight).sum() / pixel_weight.sum()
 
-        # Dice loss per matched (slot, part) pair (part channels only)
-        for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+        # Dice loss per matched (slot, part) pair (part channels only; incl. base)
+        for pi, gi in pairs:
             pred_mask = pred_up[b, pi]            # [H, W] soft
             gt_mask   = gt_masks[b, gi]           # [H, W] binary
             inter = (pred_mask * gt_mask).sum()
@@ -739,6 +752,11 @@ def sdf_render_loss(
         # inverse-transformed (slot-0 type logits are zeroed → mp2≈uniform otherwise).
         motion_probs[:, 0] = motion_probs.new_tensor([1.0, 0.0, 0.0])
 
+        # ── Pass A: collect samples across ALL (batch, frame) — NO shared MLP ──
+        # Deferring the SDF/RGB MLPs to a single global call below means each shared
+        # param is used exactly once per backward → DDP reduces it once (no "marked
+        # ready twice" under gradient checkpointing on multi-GPU).
+        feats_list, sbias_list, jobs = [], [], []
         for b in range(B):
             # pred-slot → GT part map (shared across frames).
             # Base part: pred slot 0 ↔ GT part 0 (fixed by design, not in `matches`).
@@ -770,46 +788,84 @@ def sdf_render_loss(
                 pix_xy = torch.stack([(pix_flat % W).float(), (pix_flat // W).float()], dim=-1)
 
                 ro, rd = generate_rays(extrinsics[b, s].float(), intrinsics[b].float(), pix_xy)
-                out = render_rays_static(
+                cd = collect_samples(
                     head, planes_f[b], center_f[b], size_f[b], alive, ro, rd,
-                    beta=beta, n_samples=n_samples,
+                    n_samples=n_samples,
                     motion_probs=motion_probs[b], axis=axis_f[b], pivot=pivot_f[b],
                     scalar=scal_f[b, :, s], scene_radius=scene_radius,
                 )
+                if cd is None:
+                    continue
+                feats_list.append(cd["feats"])
+                sbias_list.append(cd["s_bias"])
+                jobs.append({
+                    "b": b, "s": s, "M": cd["feats"].shape[0], "Nr": pix_xy.shape[0],
+                    "ray_idx": cd["ray_idx"], "t_starts": cd["t_starts"],
+                    "t_ends": cd["t_ends"], "part": cd["part"],
+                    "masks": masks, "union": union, "pix_flat": pix_flat, "pix_xy": pix_xy,
+                    "alive": alive, "pred2gt": pred2gt, "rendered_gt": rendered_gt,
+                })
 
-                gt_rgb = gt_images[b, s].float().reshape(3, -1)[:, pix_flat].transpose(0, 1)
-                gt_un  = union.reshape(-1)[pix_flat]
-                fg_mask = gt_un > 0.5
+        if len(feats_list) == 0:
+            return total
 
-                opacity = out["opacity"][:, 0].clamp(1e-5, 1 - 1e-5)
-                l_sil = F.binary_cross_entropy(opacity, gt_un)
-                l_part = planes.new_zeros(())
-                for pi in range(P):
-                    if not bool(alive[pi]):
-                        continue
-                    gt_p = masks[pred2gt[pi]].reshape(-1)[pix_flat]
-                    po = out["part_opacity"][:, pi].clamp(1e-5, 1 - 1e-5)
-                    l_part = l_part + F.binary_cross_entropy(po, gt_p)
-                l_part = l_part / max(len(rendered_gt), 1)
+        # ── Single global SDF/RGB MLP call over every frame's samples ──
+        feats_cat = torch.cat(feats_list)
+        sbias_cat = torch.cat(sbias_list)
+        sdf_cat   = head.sdf_mlp(feats_cat) + sbias_cat
+        rgb_cat   = torch.sigmoid(head.rgb_mlp(feats_cat))
+        sigma_cat = volsdf_density(sdf_cat[:, 0], beta)
 
-                l_rgb = (out["rgb"][fg_mask] - gt_rgb[fg_mask]).abs().mean() \
-                    if fg_mask.any() else planes.new_zeros(())
+        # ── Pass B: composite each frame from its slice & accumulate losses ──
+        off = 0
+        for job in jobs:
+            M = job["M"]
+            sig = sigma_cat[off:off + M]
+            col = rgb_cat[off:off + M]
+            off += M
+            out = composite_samples(
+                sig, col, job["ray_idx"], job["t_starts"], job["t_ends"],
+                job["part"], job["Nr"], P,
+            )
 
-                # Depth: expected ray distance vs GT camera-z depth → ray distance.
-                l_depth = planes.new_zeros(())
-                if gt_depth is not None and w_depth > 0:
-                    K = intrinsics[b].float()
-                    u = pix_xy[:, 0]; v = pix_xy[:, 1]
-                    raylen = torch.sqrt(((u - K[0, 2]) / K[0, 0]) ** 2
-                                        + ((v - K[1, 2]) / K[1, 1]) ** 2 + 1.0)
-                    t_gt = gt_depth[b, s].float().reshape(-1)[pix_flat] * raylen
-                    dm = fg_mask & (t_gt > 0)
-                    if dm.any():
-                        l_depth = (out["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
+            b, s = job["b"], job["s"]
+            masks, union = job["masks"], job["union"]
+            pix_flat, pix_xy = job["pix_flat"], job["pix_xy"]
+            alive, pred2gt, rendered_gt = job["alive"], job["pred2gt"], job["rendered_gt"]
 
-                total = total + (w_sil * l_sil + w_part * l_part
-                                 + w_rgb * l_rgb + w_depth * l_depth)
-                n_terms += 1
+            gt_rgb = gt_images[b, s].float().reshape(3, -1)[:, pix_flat].transpose(0, 1)
+            gt_un  = union.reshape(-1)[pix_flat]
+            fg_mask = gt_un > 0.5
+
+            opacity = out["opacity"][:, 0].clamp(1e-5, 1 - 1e-5)
+            l_sil = F.binary_cross_entropy(opacity, gt_un)
+            l_part = planes.new_zeros(())
+            for pi in range(P):
+                if not bool(alive[pi]):
+                    continue
+                gt_p = masks[pred2gt[pi]].reshape(-1)[pix_flat]
+                po = out["part_opacity"][:, pi].clamp(1e-5, 1 - 1e-5)
+                l_part = l_part + F.binary_cross_entropy(po, gt_p)
+            l_part = l_part / max(len(rendered_gt), 1)
+
+            l_rgb = (out["rgb"][fg_mask] - gt_rgb[fg_mask]).abs().mean() \
+                if fg_mask.any() else planes.new_zeros(())
+
+            # Depth: expected ray distance vs GT camera-z depth → ray distance.
+            l_depth = planes.new_zeros(())
+            if gt_depth is not None and w_depth > 0:
+                K = intrinsics[b].float()
+                u = pix_xy[:, 0]; v = pix_xy[:, 1]
+                raylen = torch.sqrt(((u - K[0, 2]) / K[0, 0]) ** 2
+                                    + ((v - K[1, 2]) / K[1, 1]) ** 2 + 1.0)
+                t_gt = gt_depth[b, s].float().reshape(-1)[pix_flat] * raylen
+                dm = fg_mask & (t_gt > 0)
+                if dm.any():
+                    l_depth = (out["depth"][:, 0][dm] - t_gt[dm]).abs().mean()
+
+            total = total + (w_sil * l_sil + w_part * l_part
+                             + w_rgb * l_rgb + w_depth * l_depth)
+            n_terms += 1
 
     return total / max(n_terms, 1)
 
@@ -1066,10 +1122,15 @@ def eval_mean_iou(model, val_loader, device, cfg) -> float:
     model.eval()
     iou_sum, count = 0.0, 0
     is_phase1b = (cfg.phase != "1a")
+    # Cap val batches: an IoU estimate doesn't need the full 15% val split, and an
+    # unbounded rank-0-only loop can exceed the NCCL watchdog timeout → other ranks abort.
+    max_batches = getattr(cfg, "val_max_batches", 64)
 
     try:
         with torch.no_grad():
-            for batch in val_loader:
+            for _vi, batch in enumerate(val_loader):
+                if _vi >= max_batches:
+                    break
                 images     = batch["images"].to(device)
                 extrinsics = batch["extrinsics"].to(device)
                 intrinsics = batch["intrinsics"].to(device)
@@ -1106,7 +1167,13 @@ def eval_mean_iou(model, val_loader, device, cfg) -> float:
 
                     for b in range(B):
                         pred_idx, gt_idx = matches[b]
-                        for pi, gi in zip(pred_idx.tolist(), gt_idx.tolist()):
+                        # Include the fixed base pair (slot0↔gt0) when the bg-sink
+                        # is active, mirroring mask_loss — else the base part (the
+                        # biggest, easiest part) is excluded and IoU understates.
+                        pairs = list(zip(pred_idx.tolist(), gt_idx.tolist()))
+                        if bg_map is not None:
+                            pairs = [(0, 0)] + pairs
+                        for pi, gi in pairs:
                             if is_dead[b, pi]:
                                 continue
                             gt_m = gt_masks_f0[b, gi]
@@ -1219,7 +1286,9 @@ def main(cfg: argparse.Namespace):
     is_dist = world_size > 1
 
     if is_dist:
-        dist.init_process_group("nccl")
+        # Long timeout: validation runs on rank 0 only (others wait at the post-val
+        # broadcast); the default 10-min NCCL watchdog can abort them if val is slow.
+        dist.init_process_group("nccl", timeout=timedelta(minutes=30))
         torch.cuda.set_device(local_rank)
 
     device = torch.device(f"cuda:{local_rank}")
@@ -1245,6 +1314,32 @@ def main(cfg: argparse.Namespace):
     _resume_ckpt = None
     if cfg.resume:
         _resume_ckpt = torch.load(cfg.resume, map_location=device)
+
+        # Cross-resolution resume (e.g. 1a@518 → 1b@252): the DINOv2 pos_embed is
+        # sized by img_size at construction. Bicubic-interpolate the saved patch
+        # grid to the current size — same op DINOv2 applies at runtime for
+        # variable input, done once at load.
+        _pe_key = "aggregator.patch_embed.pos_embed"
+        _saved_sd = _resume_ckpt.get("model", {})
+        if _pe_key in _saved_sd:
+            _pe_saved = _saved_sd[_pe_key]
+            _pe_model = dict(model.named_parameters()).get(_pe_key)
+            if _pe_model is not None and _pe_saved.shape != _pe_model.shape:
+                C = _pe_saved.shape[-1]
+                cls_tok = _pe_saved[:, :1]
+                grid    = _pe_saved[:, 1:]
+                n_old = int(math.isqrt(grid.shape[1]))
+                n_new = int(math.isqrt(_pe_model.shape[1] - 1))
+                grid = grid.reshape(1, n_old, n_old, C).permute(0, 3, 1, 2).float()
+                grid = F.interpolate(grid, size=(n_new, n_new),
+                                     mode="bicubic", align_corners=False)
+                grid = grid.permute(0, 2, 3, 1).reshape(1, n_new * n_new, C)
+                _saved_sd[_pe_key] = torch.cat(
+                    [cls_tok, grid.to(_pe_saved.dtype)], dim=1)
+                if is_main:
+                    print(f"[resume] pos_embed interpolated {n_old}² → {n_new}² "
+                          f"(cross-resolution resume)")
+
         if getattr(cfg, "partial_resume", False):
             # Load only aggregator + camera_head; leave other modules at random init.
             # Used when PartSlotRouter architecture changed between runs.
@@ -1256,6 +1351,14 @@ def main(cfg: argparse.Namespace):
             _resume_ckpt = None     # skip optimizer/scheduler restore below
             if is_main:
                 print(f"Partial resume (aggregator only) from {cfg.resume}")
+        elif getattr(cfg, "reset_step", False):
+            # Weights-only resume (e.g. 1a→1b): keep ALL trained weights (router/
+            # segmentation incl.), but start step/optimizer/scheduler/warmup fresh.
+            model.load_state_dict(_resume_ckpt["model"], strict=False)
+            start_step = 0
+            _resume_ckpt = None
+            if is_main:
+                print(f"Weights-only resume from {cfg.resume} (step reset to 0)")
         else:
             model.load_state_dict(_resume_ckpt["model"], strict=False)
             start_step = _resume_ckpt.get("step", 0)
@@ -1271,12 +1374,33 @@ def main(cfg: argparse.Namespace):
             print("Slot tokens re-initialized (reset_slot_tokens=True)")
 
     if is_dist:
+        # The shared SDF/RGB query MLPs are used in the LOSS-side renderer
+        # (compute_loss → raw_model.sdf_head), i.e. OUTSIDE model.forward(). With
+        # find_unused_parameters=True, DDP pre-marks them "ready" at forward-end
+        # (not in the forward graph), then their real grad hooks fire in backward →
+        # "marked ready twice". So EXCLUDE them from DDP's reducer and all-reduce
+        # their grads manually after backward (see _manual_sync_params). The
+        # single global MLP call in sdf_render_loss makes that grad clean (one use).
+        # find_unused_parameters stays True for the checkpointed aggregator blocks
+        # (hidden from the forward-graph traversal → would otherwise be "unused").
+        if cfg.phase != "1a":
+            _ddp_ignored = [n for n, _ in model.named_parameters()
+                            if n.startswith("sdf_head.sdf_mlp.")
+                            or n.startswith("sdf_head.rgb_mlp.")]
+            DDP._set_params_and_buffers_to_ignore_for_model(model, _ddp_ignored)
         model = DDP(model, device_ids=[local_rank],
                     find_unused_parameters=True,
                     gradient_as_bucket_view=True,
                     bucket_cap_mb=25)
 
     raw_model = model.module if is_dist else model
+
+    # Loss-side SDF/RGB MLPs are excluded from DDP's reducer (1b); all-reduce their
+    # grads manually after each backward so every rank stays in sync.
+    _manual_sync_params = (
+        list(raw_model.sdf_head.sdf_mlp.parameters())
+        + list(raw_model.sdf_head.rgb_mlp.parameters())
+    ) if (is_dist and cfg.phase != "1a") else []
 
     # ── Datasets ───────────────────────────────────────────────────────────
     ds_phase = "1" if cfg.phase in ("1a", "1b") else "2"
@@ -1337,9 +1461,17 @@ def main(cfg: argparse.Namespace):
         weight_decay = cfg.weight_decay,
     )
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.total_steps, eta_min=cfg.lr * 0.01,
-    )
+    # Linear warmup → cosine decay. A fresh router/attention hit with the full
+    # peak lr at step 0 destabilises early (phase-1a IoU collapsed to ~0 for the
+    # first ~6k steps in the no-warmup run); ramping in avoids that.
+    _warmup_steps = getattr(cfg, "lr_warmup_steps", 500)
+    _eta_ratio = 0.01
+    def _lr_lambda(s):
+        if s < _warmup_steps:
+            return (s + 1) / max(1, _warmup_steps)
+        prog = (s - _warmup_steps) / max(1, cfg.total_steps - _warmup_steps)
+        return _eta_ratio + (1.0 - _eta_ratio) * 0.5 * (1.0 + math.cos(math.pi * prog))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
     scaler = GradScaler("cuda")
 
@@ -1424,6 +1556,15 @@ def main(cfg: argparse.Namespace):
             continue
 
         loss.backward()
+        # Manual grad sync for the DDP-excluded loss-side SDF/RGB MLPs. All ranks
+        # reach here together (the loss_ok gate guarantees it); zero-fill a rank's
+        # grad if it produced none this step.
+        if _manual_sync_params:
+            for p in _manual_sync_params:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
+                dist.all_reduce(p.grad)
+                p.grad.div_(world_size)
         torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         optimizer.step()
         scheduler.step()
@@ -1550,6 +1691,11 @@ def parse_args():
     # Warmup gate
     p.add_argument("--warmup_iou_threshold", type=float, default=0.6)
     p.add_argument("--val_interval",    type=int, default=500)
+    p.add_argument("--val_max_batches", type=int, default=64,
+                   help="cap validation to this many batches (rank-0-only eval; "
+                        "unbounded val can exceed the NCCL watchdog timeout)")
+    p.add_argument("--lr_warmup_steps", type=int, default=500,
+                   help="linear lr warmup steps before cosine decay (avoids early collapse)")
 
     # Loss weights
     p.add_argument("--w_type",          type=float, default=0.5)
@@ -1562,6 +1708,9 @@ def parse_args():
     p.add_argument("--w_render_global", type=float, default=0.0,
                    help="Weight for global composited RGB rendering loss (gsplat rasterization). "
                         "Set > 0 in Phase 1b to supervise full-scene appearance.")
+    p.add_argument("--w_depth",         type=float, default=1.0,
+                   help="Weight for GT-depth supervision in the SDF render loss. "
+                        "Set 0 to disable (paper-aligned; A/B showed ~no effect under modal masks).")
     p.add_argument("--w_pseudo_mask",   type=float, default=0.05)
     p.add_argument("--w_bbox",          type=float, default=0.5)
     p.add_argument("--w_pose_enc",      type=float, default=0.1,
@@ -1594,6 +1743,9 @@ def parse_args():
     p.add_argument("--resume",          default=None)
     p.add_argument("--partial_resume",  action="store_true",
                    help="Load only aggregator weights from checkpoint (for arch changes)")
+    p.add_argument("--reset_step",      action="store_true",
+                   help="Weights-only resume: load ALL weights but reset step/optimizer/"
+                        "scheduler/warmup (use for 1a→1b to keep the trained segmentation)")
     p.add_argument("--reset_scheduler", action="store_true",
                    help="Start LR scheduler fresh from cfg.lr (ignore saved scheduler state)")
     p.add_argument("--reset_slot_tokens", action="store_true",
